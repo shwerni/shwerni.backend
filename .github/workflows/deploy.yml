@@ -21,7 +21,7 @@ jobs:
         run: npm run build
 
       - name: Deploy to Mau
-        run: npx @nestjs/mau deploy
+        run: printf "%s\n%s\n" "$MAU_API_KEY" "$MAU_API_SECRET" | npx @nestjs/mau deploy
         env:
           MAU_API_KEY: ${{ secrets.MAU_API_KEY }}
           MAU_API_SECRET: ${{ secrets.MAU_API_SECRET }}
