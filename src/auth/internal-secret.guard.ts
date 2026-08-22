@@ -1,8 +1,12 @@
-// React & Expo — n/a, nest imports below
-
 // packages
-import { CanActivate, ExecutionContext, Injectable, UnauthorizedException } from "@nestjs/common";
-import { timingSafeEqual } from "crypto";
+import {
+  CanActivate,
+  ExecutionContext,
+  Injectable,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { timingSafeEqual } from 'crypto';
+import type { Request } from 'express';
 
 /**
  * guards internal http endpoints only next.js is allowed to call,
@@ -11,15 +15,18 @@ import { timingSafeEqual } from "crypto";
 @Injectable()
 export class InternalSecretGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean {
-    const request = context.switchToHttp().getRequest();
-    const provided: string | undefined = request.headers["x-internal-secret"];
-    const expected = process.env.INTERNAL_SHARED_SECRET!;
+    const request = context.switchToHttp().getRequest<Request>();
+    const provided = request.headers['x-internal-secret'] as string | undefined;
+    const expected = process.env.INTERNAL_SHARED_SECRET;
 
     if (!provided || provided.length !== expected.length) {
       throw new UnauthorizedException();
     }
 
-    const isValid = timingSafeEqual(Buffer.from(provided), Buffer.from(expected));
+    const isValid = timingSafeEqual(
+      Buffer.from(provided),
+      Buffer.from(expected),
+    );
     if (!isValid) throw new UnauthorizedException();
 
     return true;

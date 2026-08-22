@@ -1,9 +1,10 @@
 // packages
-import { Body, Controller, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, Post, UseGuards } from '@nestjs/common';
 
 // utils
 import { InternalSecretGuard } from '../auth/internal-secret.guard';
 import { RealtimeGateway } from './realtime.gateway';
+import { PresenceService } from './presence.service';
 import type { InstantRequestBroadcast } from './dto/instant-request.dto';
 
 /**
@@ -13,11 +14,19 @@ import type { InstantRequestBroadcast } from './dto/instant-request.dto';
 @Controller('internal')
 @UseGuards(InternalSecretGuard)
 export class InternalController {
-  constructor(private readonly gateway: RealtimeGateway) {}
+  constructor(
+    private readonly gateway: RealtimeGateway,
+    private readonly presence: PresenceService,
+  ) {}
 
   @Post('instant-request')
   broadcastInstantRequest(@Body() payload: InstantRequestBroadcast) {
     this.gateway.broadcastInstantRequest(payload);
     return { ok: true };
+  }
+
+  @Get('presence/online')
+  getOnlinePresence() {
+    return { onlineIds: this.presence.getOnlineIds() };
   }
 }
