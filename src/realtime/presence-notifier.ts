@@ -1,4 +1,4 @@
-const NEXT_INTERNAL_URL = 'http://192.168.1.4:3000'; // process.env.NEXT_INTERNAL_URL;
+const NEXT_INTERNAL_URL = process.env.NEXT_INTERNAL_URL;
 
 /**
  * tells next.js a consultant's live presence changed so the db stays
