@@ -2,17 +2,26 @@
 import { Injectable, NestMiddleware } from '@nestjs/common';
 import type { Request, Response, NextFunction } from 'express';
 
+const ALLOWED_HOST = 'realtime.shwerni.sa';
+
 /**
- * redirects any http request to https, using the x-forwarded-proto
- * header set by the load balancer since the app itself sits behind it
+ * blocks direct access via the raw alb hostname and forces https
+ * on the custom domain, since ssl terminates at the load balancer
  */
 @Injectable()
 export class HttpsRedirectMiddleware implements NestMiddleware {
   use(req: Request, res: Response, next: NextFunction) {
-    const forwardedProto = req.headers['x-forwarded-proto'];
+    const host = req.headers.host;
 
+    if (host && host.includes('elb.amazonaws.com')) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    const forwardedProto = req.headers['x-forwarded-proto'];
     if (forwardedProto === 'http') {
-      return res.redirect(301, `https://${req.headers.host}${req.originalUrl}`);
+      res.redirect(301, `https://${ALLOWED_HOST}${req.originalUrl}`);
+      return;
     }
 
     next();

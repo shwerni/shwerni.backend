@@ -40,6 +40,14 @@ export class RealtimeGateway
   ) {}
 
   async handleConnection(socket: Socket) {
+    const forwardedProto = socket.handshake.headers['x-forwarded-proto'];
+
+    // reject any socket handshake that arrived over plain http
+    if (forwardedProto === 'http') {
+      socket.disconnect(true);
+      return;
+    }
+
     const ip = socket.handshake.address;
     if (!this.rateLimiter.allow(ip)) {
       socket.disconnect(true);
@@ -57,7 +65,7 @@ export class RealtimeGateway
     const data = socket.data as SocketData;
     data.userId = payload.userId;
     data.role = payload.role;
-    socket.join(`user:${payload.userId}`);
+    await socket.join(`user:${payload.userId}`);
   }
 
   handleDisconnect(socket: Socket) {
