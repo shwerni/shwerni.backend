@@ -12,13 +12,20 @@ export type RealtimePayload = {
 export async function verifyRealtimeToken(token: string | undefined) {
   if (!token) return null;
 
-  if (!process.env.REALTIME_JWT_SECRET) return null;
+  if (!process.env.REALTIME_JWT_SECRET) {
+    console.error('[verify-token] REALTIME_JWT_SECRET is not set');
+    return null;
+  }
 
   try {
     const secret = new TextEncoder().encode(process.env.REALTIME_JWT_SECRET);
     const { payload } = await jwtVerify(token, secret);
     return payload as RealtimePayload;
-  } catch {
+  } catch (error) {
+    console.error(
+      '[verify-token] verification failed:',
+      (error as Error).message,
+    );
     return null;
   }
 }

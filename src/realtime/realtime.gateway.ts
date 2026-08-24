@@ -23,6 +23,7 @@ import type {
   InstantResponseBroadcast,
 } from './dto/instant-request.dto.js';
 import type { PresenceChangedBroadcast } from './dto/presence.dto.js';
+import { notifyInstantSnapshot } from './instant-snapshot-notifier.js';
 
 const INSTANT_REQUEST_TIMEOUT_MS = 30_000;
 const PUBLIC_ROOM = 'public-presence';
@@ -94,6 +95,12 @@ export class RealtimeGateway
     if (payload.role === 'OWNER') {
       await socket.join(`user:${payload.userId}`);
       this.logger.log(`${socket.id} joined user:${payload.userId}`);
+    }
+
+    // record a daily stats snapshot now that this socket is counted in the room
+    if (payload.role !== 'GUEST') {
+      const counts = this.getConnectionCounts();
+      void notifyInstantSnapshot(counts.owners, counts.clients, payload.role);
     }
   }
 
@@ -190,12 +197,36 @@ export class RealtimeGateway
   getOnlineConsultants() {
     return this.presence.getOnlineIds();
   }
+  /**
+   * counts connected sockets by role, reading directly from the public
+   * room's membership — no separate map to maintain, near-zero cost
+   */
+  getConnectionCounts() {
+    const room = this.server.sockets.adapter.rooms.get(PUBLIC_ROOM);
+    if (!room) return { owners: 0, clients: 0, guests: 0, total: 0 };
+
+    let owners = 0;
+    let clients = 0;
+    let guests = 0;
+
+    for (const socketId of room) {
+      const socket = this.server.sockets.sockets.get(socketId);
+      const role = (socket?.data as SocketData | undefined)?.role;
+
+      if (role === 'OWNER') owners++;
+      else if (role === 'USER') clients++;
+      else guests++;
+    }
+
+    return { owners, clients, guests, total: owners + clients + guests };
+  }
 
   private broadcastPresence(consultantId: string, online: boolean) {
     this.server.to(PUBLIC_ROOM).emit('presence-changed', {
       consultantId,
       online,
       onlineCount: this.presence.getOnlineIds().length,
+      counts: this.getConnectionCounts(),
     } satisfies PresenceChangedBroadcast);
   }
 
