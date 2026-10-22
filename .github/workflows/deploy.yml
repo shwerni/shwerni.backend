@@ -20,8 +20,10 @@ jobs:
       - name: Build project
         run: npm run build
 
+      # mau's default base image is node:24.18.0-bullseye-slim, and bullseye is end of life
+      # (apt-get gets 404s from debian-security). same node version, bookworm
       - name: Deploy to Mau
-        run: npx @nestjs/mau deploy
+        run: npx @nestjs/mau deploy --image node:24.18.0-bookworm-slim
         env:
           MAU_KEY: ${{ secrets.MAU_API_KEY }}
           MAU_SECRET: ${{ secrets.MAU_API_SECRET }}
