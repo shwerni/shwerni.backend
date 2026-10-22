@@ -16,18 +16,23 @@ import type { Request } from 'express';
 export class InternalSecretGuard implements CanActivate {
   canActivate(context: ExecutionContext): boolean {
     const request = context.switchToHttp().getRequest<Request>();
-    const provided = request.headers['x-internal-secret'] as string | undefined;
+    const provided = request.headers['x-internal-secret'];
     const expected = process.env.INTERNAL_SHARED_SECRET;
 
-    if (!provided || provided.length !== expected.length) {
+    // an unset secret or a missing / malformed header is a 401, never a 500
+    if (!expected || typeof provided !== 'string' || !provided) {
       throw new UnauthorizedException();
     }
 
-    const isValid = timingSafeEqual(
-      Buffer.from(provided),
-      Buffer.from(expected),
-    );
-    if (!isValid) throw new UnauthorizedException();
+    // timingSafeEqual throws on different lengths, and those are bytes, not characters
+    const providedBytes = Buffer.from(provided);
+    const expectedBytes = Buffer.from(expected);
+    if (
+      providedBytes.length !== expectedBytes.length ||
+      !timingSafeEqual(providedBytes, expectedBytes)
+    ) {
+      throw new UnauthorizedException();
+    }
 
     return true;
   }

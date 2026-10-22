@@ -41,7 +41,29 @@ describe('PresenceService', () => {
   it('a later booking replaces the block', () => {
     const later = Date.now() + 120_000;
     presence.setBusy('a', 7, Date.now() + 60_000);
-    presence.setBusy('a', 8, later);
+    expect(presence.setBusy('a', 8, later)).toEqual({
+      orderId: 8,
+      busyUntil: later,
+    });
     expect(presence.getBusy('a')).toEqual({ orderId: 8, busyUntil: later });
+  });
+
+  it('a booking that ends sooner keeps the running block', () => {
+    const later = Date.now() + 120_000;
+    presence.setBusy('a', 7, later);
+    expect(presence.setBusy('a', 8, Date.now() + 60_000)).toEqual({
+      orderId: 7,
+      busyUntil: later,
+    });
+    expect(presence.getBusy('a')).toEqual({ orderId: 7, busyUntil: later });
+  });
+
+  it('an expired block is replaced whatever its end', () => {
+    const next = Date.now() + 60_000;
+    presence.setBusy('a', 7, Date.now() - 1);
+    expect(presence.setBusy('a', 8, next)).toEqual({
+      orderId: 8,
+      busyUntil: next,
+    });
   });
 });

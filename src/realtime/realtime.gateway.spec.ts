@@ -13,6 +13,7 @@ jest.mock('../auth/verify-token.js', () => ({
 }));
 
 // utils
+import { verifyRealtimeToken } from '../auth/verify-token.js';
 import { RealtimeGateway } from './realtime.gateway';
 import { PresenceService } from './presence.service';
 import { InstantRequestService } from './instant-request.service';
@@ -103,5 +104,73 @@ describe('RealtimeGateway consultant-online', () => {
       busyUntil,
     });
     expect(presence.getOnlineIds()).toEqual([]);
+  });
+});
+
+describe('RealtimeGateway markConsultantBusy', () => {
+  it('instant-booked carries the block in force, not a shorter one', async () => {
+    const presence = new PresenceService();
+    const gateway = new RealtimeGateway(
+      new InstantRequestService(),
+      new ConnectionRateLimiter(),
+      presence,
+    );
+    const emit = jest.fn();
+    gateway.server = {
+      to: jest.fn(() => ({ emit })),
+      sockets: { adapter: { rooms: new Map() }, sockets: new Map() },
+    } as unknown as Server;
+
+    const running = Date.now() + 120_000;
+    presence.setBusy('owner-1', 7, running);
+
+    await gateway.markConsultantBusy('owner-1', {
+      orderId: 8,
+      meetingId: 'mid-8',
+      meetingUrl: 'https://shwerni.sa/meetings/mid-8',
+      startsAt: new Date().toISOString(),
+      duration: 30,
+      busyUntil: Date.now() + 60_000,
+    });
+
+    expect(emit).toHaveBeenCalledWith(
+      'instant-booked',
+      expect.objectContaining({ orderId: 8, busyUntil: running }),
+    );
+    expect(presence.getBusy('owner-1')).toEqual({
+      orderId: 7,
+      busyUntil: running,
+    });
+  });
+});
+
+describe('RealtimeGateway connection rate limit', () => {
+  it('limits by the right-most x-forwarded-for entry, not the load balancer', async () => {
+    const limiter = new ConnectionRateLimiter();
+    const allow = jest.spyOn(limiter, 'allow');
+    const gateway = new RealtimeGateway(
+      new InstantRequestService(),
+      limiter,
+      new PresenceService(),
+    );
+    (verifyRealtimeToken as jest.Mock).mockResolvedValue(null);
+
+    const disconnect = jest.fn();
+    const socket = {
+      id: 's1',
+      data: {},
+      disconnect,
+      handshake: {
+        address: '10.0.0.2',
+        auth: {},
+        headers: { 'x-forwarded-for': '6.6.6.6, 203.0.113.7' },
+      },
+    } as unknown as Socket;
+
+    await gateway.handleConnection(socket);
+
+    expect(allow).toHaveBeenCalledWith('203.0.113.7');
+    // no token: refused after the limiter, as before
+    expect(disconnect).toHaveBeenCalledWith(true);
   });
 });

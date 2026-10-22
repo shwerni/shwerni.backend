@@ -1,7 +1,8 @@
 /**
  * end-to-end check of instant presence on a running realtime server: consultant-online (ack and
- * the app's no-ack emit), a double emit from one socket, /internal/consultant-busy,
- * instant-booked, instant-busy, the busy expiry, and disconnects.
+ * the app's no-ack emit), a double emit from one socket, /internal/consultant-busy (guard and
+ * body checks), instant-booked, instant-busy, a second booking that ends sooner, the busy
+ * expiry, disconnects, and (local servers only) the rate limit keyed on x-forwarded-for.
  *
  * secrets come from env vars only (never write them in this file):
  *   BASE                    server url, default http://127.0.0.1:4100
@@ -72,6 +73,23 @@ async function busy(body, secret = INTERNAL) {
 const timeout = (promise, ms = 2000) =>
   Promise.race([promise, wait(ms).then(() => null)]);
 
+// a guest connection with extra handshake headers: refused = the server dropped it
+function probe(headers) {
+  return new Promise((resolve) => {
+    const s = io(BASE, {
+      auth: { token: token(`guest:${crypto.randomUUID()}`, 'GUEST') },
+      transports: ['websocket'],
+      extraHeaders: headers,
+      reconnection: false,
+    });
+    s.once('connect_error', () => resolve({ s, refused: true }));
+    s.once('disconnect', () => resolve({ s, refused: true }));
+    s.once('connect', () =>
+      setTimeout(() => resolve({ s, refused: !s.connected }), 300),
+    );
+  });
+}
+
 (async () => {
   const owner = `test-owner-${crypto.randomUUID()}`;
   const payload = (busyUntil) => ({
@@ -108,12 +126,17 @@ const timeout = (promise, ms = 2000) =>
   check('wrong secret → 401', (await busy(payload(Date.now() + 60_000), 'x'.repeat(INTERNAL.length))).status === 401);
   check('bad body → 400', (await busy({ consultantId: owner })).status === 400);
   check('busyUntil in the past → 400', (await busy(payload(Date.now() - 1))).status === 400);
+  check('no secret → 401', (await busy(payload(Date.now() + 60_000), '')).status === 401);
+  check('a secret of the same length in more bytes → 401 (not 500)', (await busy(payload(Date.now() + 60_000), 'é'.repeat(INTERNAL.length))).status === 401);
+  check('duration the site does not sell → 400', (await busy({ ...payload(Date.now() + 60_000), duration: 40 })).status === 400);
+  check('startsAt not a date → 400', (await busy({ ...payload(Date.now() + 60_000), startsAt: 'soon' })).status === 400);
+  check('busyUntil more than 4h ahead → 400', (await busy(payload(Date.now() + 5 * 3_600_000))).status === 400);
   check('still listed after refused calls', (await onlineIds()).includes(owner));
 
   // 4. consultant-busy
   const booked = new Promise((r) => ownerSocket.once('instant-booked', r));
   const changed = new Promise((r) => guest.once('presence-changed', r));
-  const busyUntil = Date.now() + 4_000;
+  const busyUntil = Date.now() + 6_000;
   const res = await busy(payload(busyUntil));
   check('consultant-busy → 201 { ok, wasOnline: true }', res.status === 201 && res.json?.ok && res.json?.wasOnline === true, JSON.stringify(res));
   const bookedPayload = await timeout(booked);
@@ -131,6 +154,15 @@ const timeout = (promise, ms = 2000) =>
   ownerSocket.emit('consultant-online'); // the app's way: no ack
   await wait(500);
   check('no-ack emit while busy stays offline', !(await onlineIds()).includes(owner));
+
+  // 5b. a second booking that ends sooner keeps the running block
+  const booked2 = new Promise((r) => ownerSocket.once('instant-booked', r));
+  const res2 = await busy({ ...payload(busyUntil - 2_000), orderId: 4243 });
+  check('shorter second booking → 201', res2.status === 201, JSON.stringify(res2));
+  const booked2Payload = await timeout(booked2);
+  check('its instant-booked carries the running block', booked2Payload?.orderId === 4243 && booked2Payload?.busyUntil === busyUntil, JSON.stringify(booked2Payload));
+  const ack2b = await ownerSocket.timeout(3000).emitWithAck('consultant-online');
+  check('still refused until the first busyUntil', ack2b?.online === false && ack2b?.busyUntil === busyUntil, JSON.stringify(ack2b));
 
   // 6. a new connection while busy (reconnect, second tab) is refused too
   const second = await connect(owner, 'OWNER');
@@ -150,6 +182,28 @@ const timeout = (promise, ms = 2000) =>
   check('offline after disconnect', !(await onlineIds()).includes(owner));
 
   guest.disconnect();
+
+  // 9. the rate limit follows the right-most x-forwarded-for entry. local servers only: behind
+  // the load balancer that entry is the tester's real ip, appended by the balancer
+  if (/^https?:\/\/(127\.0\.0\.1|localhost)(:|\/|$)/.test(BASE)) {
+    const n = () => Math.floor(Math.random() * 250) + 1;
+    const limited = `203.0.113.${n()}`;
+    const probes = [];
+    for (let i = 0; i < 20; i++)
+      probes.push(await probe({ 'x-forwarded-for': `6.6.6.${i}, ${limited}` }));
+    check('20 connections from one forwarded ip pass', probes.every((p) => !p.refused));
+
+    const over = await probe({ 'x-forwarded-for': `7.7.7.7, ${limited}` });
+    check('the 21st is refused, whatever the left-most entry says', over.refused);
+
+    const other = await probe({ 'x-forwarded-for': `${limited}, 198.51.100.${n()}` });
+    check('another right-most ip still connects', !other.refused);
+
+    for (const p of [...probes, over, other]) p.s.disconnect();
+  } else {
+    console.log('SKIP  rate limit by x-forwarded-for (not a local server)');
+  }
+
   console.log(failed ? `\n${failed} FAILED` : '\nall passed');
   process.exit(failed ? 1 : 0);
 })().catch((err) => {

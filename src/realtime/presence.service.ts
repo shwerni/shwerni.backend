@@ -48,9 +48,19 @@ export class PresenceService {
     return this.onlineCounts.delete(consultantId);
   }
 
-  // a later booking replaces the block
-  setBusy(consultantId: string, orderId: number, busyUntil: number) {
-    this.busy.set(consultantId, { orderId, busyUntil });
+  // keeps whichever block ends later: a second booking never shortens a running one.
+  // returns the block now in force
+  setBusy(
+    consultantId: string,
+    orderId: number,
+    busyUntil: number,
+  ): { orderId: number; busyUntil: number } {
+    const current = this.getBusy(consultantId);
+    if (current && current.busyUntil >= busyUntil) return current;
+
+    const entry = { orderId, busyUntil };
+    this.busy.set(consultantId, entry);
+    return entry;
   }
 
   // the active block, an expired one is dropped on read

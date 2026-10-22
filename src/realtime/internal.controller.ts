@@ -15,6 +15,11 @@ import { PresenceService } from './presence.service';
 import type { InstantRequestBroadcast } from './dto/instant-request.dto';
 import type { ConsultantBusyRequest } from './dto/instant-booked.dto';
 
+// the session lengths the main site sells (cost30 / cost45 / cost60)
+const SESSION_DURATIONS = [30, 45, 60];
+// no session runs this long: a later busyUntil is a unit or clock bug
+const MAX_BUSY_AHEAD_MS = 4 * 60 * 60 * 1000;
+
 /**
  * next.js calls these routes after writing to the database,
  * so nest never becomes a second source of truth for order state
@@ -43,12 +48,17 @@ export class InternalController {
       typeof body.meetingId === 'string' &&
       typeof body.meetingUrl === 'string' &&
       typeof body.startsAt === 'string' &&
-      Number.isFinite(body.duration) &&
+      Number.isFinite(Date.parse(body.startsAt)) &&
+      SESSION_DURATIONS.includes(body.duration) &&
       Number.isFinite(body.busyUntil);
 
     if (!valid) throw new BadRequestException('invalid consultant-busy body');
-    if (body.busyUntil <= Date.now())
+
+    const now = Date.now();
+    if (body.busyUntil <= now)
       throw new BadRequestException('busyUntil is in the past');
+    if (body.busyUntil > now + MAX_BUSY_AHEAD_MS)
+      throw new BadRequestException('busyUntil is more than 4 hours ahead');
 
     // only the broadcast fields reach the consultant's sockets
     const { wasOnline } = await this.gateway.markConsultantBusy(

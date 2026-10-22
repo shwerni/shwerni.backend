@@ -28,20 +28,14 @@ import type {
   InstantBusyBroadcast,
 } from './dto/instant-booked.dto.js';
 import { notifyInstantSnapshot } from './instant-snapshot-notifier.js';
-import { allowedOrigins } from '../allowed-origins.js';
+import { corsOrigin } from '../allowed-origins.js';
+import { clientIp } from './client-ip.js';
 
 const INSTANT_REQUEST_TIMEOUT_MS = 30_000;
 const PUBLIC_ROOM = 'public-presence';
 
 @WebSocketGateway({
-  cors: {
-    origin: [
-      ...allowedOrigins(),
-      'shwerni://',
-      'exp://',
-      'http://localhost:3000',
-    ],
-  },
+  cors: { origin: corsOrigin },
 })
 export class RealtimeGateway
   implements OnGatewayConnection, OnGatewayDisconnect
@@ -66,7 +60,7 @@ export class RealtimeGateway
       return;
     }
 
-    const ip = socket.handshake.address;
+    const ip = clientIp(socket.handshake);
     if (!this.rateLimiter.allow(ip)) {
       this.logger.warn(`rejected ${socket.id}: rate limited (ip: ${ip})`);
       socket.disconnect(true);
@@ -189,7 +183,13 @@ export class RealtimeGateway
     consultantId: string,
     payload: InstantBookedBroadcast,
   ) {
-    this.presence.setBusy(consultantId, payload.orderId, payload.busyUntil);
+    // a running block that ends later is kept, and instant-booked says when the block really ends
+    const block = this.presence.setBusy(
+      consultantId,
+      payload.orderId,
+      payload.busyUntil,
+    );
+    const booked = { ...payload, busyUntil: block.busyUntil };
 
     const room = this.server.sockets.adapter.rooms.get(`user:${consultantId}`);
     for (const socketId of room ?? []) {
@@ -203,7 +203,7 @@ export class RealtimeGateway
     );
 
     if (wasOnline) this.broadcastPresence(consultantId, false);
-    this.server.to(`user:${consultantId}`).emit('instant-booked', payload);
+    this.server.to(`user:${consultantId}`).emit('instant-booked', booked);
 
     // always: keeps the database offline even if next.js's own write failed
     await notifyPresenceChange(consultantId, false);
