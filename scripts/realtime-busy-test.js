@@ -105,8 +105,13 @@ function connect(userId, role) {
   });
 }
 
+// the guarded list (the public /presence/online is going away)
 async function onlineIds() {
-  return (await (await fetch(`${BASE}/presence/online`)).json()).onlineIds;
+  const res = await fetch(`${BASE}/internal/presence/online`, {
+    headers: { 'x-internal-secret': INTERNAL },
+  });
+  if (!res.ok) stop(`/internal/presence/online answered ${res.status}: check INTERNAL_SHARED_SECRET`);
+  return (await res.json()).onlineIds;
 }
 
 async function busy(body, secret = INTERNAL) {
@@ -164,7 +169,13 @@ function probe(headers) {
   const guest = await connect(`guest:${crypto.randomUUID()}`, 'GUEST');
   const ack1 = await ownerSocket.timeout(3000).emitWithAck('consultant-online');
   check('consultant-online ack', ack1?.online === true, JSON.stringify(ack1));
-  check('listed in /presence/online', (await onlineIds()).includes(owner));
+  check('listed in /internal/presence/online', (await onlineIds()).includes(owner));
+
+  // live counts over the socket: owners only
+  const ownerCounts = await ownerSocket.timeout(3000).emitWithAck('get-presence-counts');
+  check('get-presence-counts as OWNER → counts', ownerCounts?.counts?.owners >= 1 && ownerCounts.counts.guests >= 1, JSON.stringify(ownerCounts));
+  const guestCounts = await guest.timeout(3000).emitWithAck('get-presence-counts');
+  check('get-presence-counts as GUEST → { counts: null }', guestCounts !== null && guestCounts.counts === null, JSON.stringify(guestCounts));
 
   // 2. a double emit from one socket adds no reference: one disconnect takes it offline
   const doubler = `test-owner-${crypto.randomUUID()}`;

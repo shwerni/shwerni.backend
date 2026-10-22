@@ -174,3 +174,48 @@ describe('RealtimeGateway connection rate limit', () => {
     expect(disconnect).toHaveBeenCalledWith(true);
   });
 });
+
+describe('RealtimeGateway get-presence-counts', () => {
+  // three sockets in the public room: an owner, a client and a guest
+  function gatewayWithSockets() {
+    const sockets = new Map<string, { data: { role: string } }>([
+      ['o1', { data: { role: 'OWNER' } }],
+      ['u1', { data: { role: 'USER' } }],
+      ['g1', { data: { role: 'GUEST' } }],
+    ]);
+    const gateway = new RealtimeGateway(
+      new InstantRequestService(),
+      new ConnectionRateLimiter(),
+      new PresenceService(),
+    );
+    gateway.server = {
+      to: jest.fn(() => ({ emit: jest.fn() })),
+      sockets: {
+        adapter: {
+          rooms: new Map([['public-presence', new Set(sockets.keys())]]),
+        },
+        sockets,
+      },
+    } as unknown as Server;
+    return gateway;
+  }
+
+  const socketWithRole = (role: string) =>
+    ({ id: 'x', data: { userId: 'x', role } }) as unknown as Socket;
+
+  it('an owner gets the counts', () => {
+    expect(
+      gatewayWithSockets().getPresenceCounts(socketWithRole('OWNER')),
+    ).toEqual({ counts: { owners: 1, clients: 1, guests: 1, total: 3 } });
+  });
+
+  it('clients and guests get { counts: null }', () => {
+    const gateway = gatewayWithSockets();
+    expect(gateway.getPresenceCounts(socketWithRole('USER'))).toEqual({
+      counts: null,
+    });
+    expect(gateway.getPresenceCounts(socketWithRole('GUEST'))).toEqual({
+      counts: null,
+    });
+  });
+});

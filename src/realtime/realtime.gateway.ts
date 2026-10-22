@@ -259,6 +259,17 @@ export class RealtimeGateway
   getOnlineConsultants() {
     return this.presence.getOnlineIds();
   }
+
+  // live connection counts for the consultant dashboard, replacing the public GET /presence/counts.
+  // owners only; every other socket gets { counts: null }, so the ack always arrives
+  @SubscribeMessage('get-presence-counts')
+  getPresenceCounts(@ConnectedSocket() socket: Socket) {
+    const data = socket.data as SocketData;
+    return {
+      counts: data.role === 'OWNER' ? this.getConnectionCounts() : null,
+    };
+  }
+
   /**
    * counts connected sockets by role, reading directly from the public
    * room's membership — no separate map to maintain, near-zero cost
