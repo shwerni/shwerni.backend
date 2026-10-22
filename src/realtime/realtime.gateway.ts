@@ -23,7 +23,12 @@ import type {
   InstantResponseBroadcast,
 } from './dto/instant-request.dto.js';
 import type { PresenceChangedBroadcast } from './dto/presence.dto.js';
+import type {
+  InstantBookedBroadcast,
+  InstantBusyBroadcast,
+} from './dto/instant-booked.dto.js';
 import { notifyInstantSnapshot } from './instant-snapshot-notifier.js';
+import { allowedOrigins } from '../allowed-origins.js';
 
 const INSTANT_REQUEST_TIMEOUT_MS = 30_000;
 const PUBLIC_ROOM = 'public-presence';
@@ -31,7 +36,7 @@ const PUBLIC_ROOM = 'public-presence';
 @WebSocketGateway({
   cors: {
     origin: [
-      process.env.ALLOWED_ORIGIN,
+      ...allowedOrigins(),
       'shwerni://',
       'exp://',
       'http://localhost:3000',
@@ -124,6 +129,7 @@ export class RealtimeGateway
     }
   }
 
+  // the return value is the ack, sent only to clients that ask for one
   @SubscribeMessage('consultant-online')
   async onConsultantOnline(@ConnectedSocket() socket: Socket) {
     const data = socket.data as SocketData;
@@ -135,7 +141,22 @@ export class RealtimeGateway
       this.logger.warn(
         `ignored consultant-online: ${socket.id} is not an OWNER`,
       );
-      return;
+      return { online: false };
+    }
+
+    // a paid instant session: no presence until it ends
+    const busy = this.presence.getBusy(data.userId);
+    if (busy) {
+      this.logger.log(
+        `refused consultant-online: ${data.userId} busy until ${new Date(busy.busyUntil).toISOString()}`,
+      );
+      socket.emit('instant-busy', {
+        orderId: busy.orderId,
+        busyUntil: busy.busyUntil,
+      } satisfies InstantBusyBroadcast);
+      // the app writes ONLINE to next.js before it emits, so the database is put back
+      await notifyPresenceChange(data.userId, false);
+      return { online: false, busyUntil: busy.busyUntil };
     }
 
     data.isOnlineConsultant = true;
@@ -147,6 +168,39 @@ export class RealtimeGateway
       this.logger.log(`notifying next.js: ${data.userId} online`);
       await notifyPresenceChange(data.userId, true);
     }
+
+    return { online: true };
+  }
+
+  /**
+   * an instant order was paid: every connection of this consultant stops
+   * counting as online, consultant-online is refused until busyUntil, and
+   * the consultant's own sockets get instant-booked
+   */
+  async markConsultantBusy(
+    consultantId: string,
+    payload: InstantBookedBroadcast,
+  ) {
+    this.presence.setBusy(consultantId, payload.orderId, payload.busyUntil);
+
+    const room = this.server.sockets.adapter.rooms.get(`user:${consultantId}`);
+    for (const socketId of room ?? []) {
+      const socket = this.server.sockets.sockets.get(socketId);
+      if (socket) (socket.data as SocketData).isOnlineConsultant = false;
+    }
+
+    const wasOnline = this.presence.clear(consultantId);
+    this.logger.log(
+      `markConsultantBusy(${consultantId}) order=${payload.orderId} wasOnline=${wasOnline}`,
+    );
+
+    if (wasOnline) this.broadcastPresence(consultantId, false);
+    this.server.to(`user:${consultantId}`).emit('instant-booked', payload);
+
+    // always: keeps the database offline even if next.js's own write failed
+    await notifyPresenceChange(consultantId, false);
+
+    return { wasOnline };
   }
 
   broadcastInstantRequest(payload: InstantRequestBroadcast) {

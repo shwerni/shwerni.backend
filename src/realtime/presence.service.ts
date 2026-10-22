@@ -9,6 +9,11 @@ import { Injectable } from '@nestjs/common';
 @Injectable()
 export class PresenceService {
   private readonly onlineCounts = new Map<string, number>();
+  // consultants with a paid instant session, blocked from going online until busyUntil
+  private readonly busy = new Map<
+    string,
+    { orderId: number; busyUntil: number }
+  >();
 
   // returns true only when this is the consultant's first active connection
   markOnline(consultantId: string): boolean {
@@ -36,5 +41,28 @@ export class PresenceService {
 
   getOnlineIds(): string[] {
     return Array.from(this.onlineCounts.keys());
+  }
+
+  // drops every connection reference at once, returns true if the consultant was online
+  clear(consultantId: string): boolean {
+    return this.onlineCounts.delete(consultantId);
+  }
+
+  // a later booking replaces the block
+  setBusy(consultantId: string, orderId: number, busyUntil: number) {
+    this.busy.set(consultantId, { orderId, busyUntil });
+  }
+
+  // the active block, an expired one is dropped on read
+  getBusy(consultantId: string): { orderId: number; busyUntil: number } | null {
+    const entry = this.busy.get(consultantId);
+    if (!entry) return null;
+
+    if (entry.busyUntil <= Date.now()) {
+      this.busy.delete(consultantId);
+      return null;
+    }
+
+    return entry;
   }
 }
