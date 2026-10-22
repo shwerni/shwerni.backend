@@ -2,29 +2,77 @@
  * end-to-end check of instant presence on a running realtime server: consultant-online (ack and
  * the app's no-ack emit), a double emit from one socket, /internal/consultant-busy (guard and
  * body checks), instant-booked, instant-busy, a second booking that ends sooner, the busy
- * expiry, disconnects, and (local servers only) the rate limit keyed on x-forwarded-for.
+ * expiry, disconnects, and the rate limit keyed on x-forwarded-for (local servers, or any server
+ * with --rate-limit).
  *
- * secrets come from env vars only (never write them in this file):
- *   BASE                    server url, default http://127.0.0.1:4100
- *   REALTIME_JWT_SECRET     the server's token secret (the script signs its own tokens)
- *   INTERNAL_SHARED_SECRET  the x-internal-secret for /internal/*
+ * run from the repo root, in any terminal (cmd, powershell, bash), after npm install:
+ *   node scripts/realtime-busy-test.js https://realtime.shwerni.sa
+ *   node scripts/realtime-busy-test.js http://127.0.0.1:4000
+ *   node scripts/realtime-busy-test.js https://realtime.shwerni.sa --rate-limit
  *
- * socket.io-client isn't a dependency of this repo; point NODE_PATH at a node_modules that has
- * it (the website repo does):
- *   NODE_PATH=<website>/node_modules BASE=... REALTIME_JWT_SECRET=... INTERNAL_SHARED_SECRET=... \
- *     node scripts/realtime-busy-test.js
+ * the server address is required. --rate-limit runs the rate-limit check against a server that
+ * isn't local too: it uses up this machine's connections for the minute, so the server refuses
+ * every connection from your ip (the site, the app, anyone sharing it) for about a minute.
+ * without it, that check runs only against 127.0.0.1 / localhost. the secrets come from the repo's .env
+ * (REALTIME_JWT_SECRET signs the test tokens, INTERNAL_SHARED_SECRET is the x-internal-secret for
+ * /internal/*); a variable already set in the terminal wins over .env. they must match the
+ * server under test. the values are never printed, and never belong in this file.
  *
  * against production it uses throwaway test-owner-<uuid> ids, but each run blocks that test id
- * for about 4 seconds and sends presence-changed to every connected client. exits 1 on any failure
+ * for about 6 seconds and sends presence-changed to every connected client. exits 1 on any failure
  */
 const crypto = require('crypto');
+const path = require('path');
 const { io } = require('socket.io-client');
 
-const BASE = process.env.BASE || 'http://127.0.0.1:4100';
+function stop(message) {
+  console.error(message);
+  process.exit(1);
+}
+
+const USAGE =
+  'usage: node scripts/realtime-busy-test.js <server url> [--rate-limit]\n' +
+  '  e.g. node scripts/realtime-busy-test.js https://realtime.shwerni.sa';
+
+const args = process.argv.slice(2);
+const flags = args.filter((a) => a.startsWith('--'));
+const positional = args.filter((a) => !a.startsWith('--'));
+
+const unknown = flags.filter((f) => f !== '--rate-limit');
+if (unknown.length) stop(`unknown option ${unknown.join(' ')}.\n${USAGE}`);
+const RATE_LIMIT_FLAG = flags.includes('--rate-limit');
+
+// the server under test: never guessed, a typo must not hit another server
+if (positional.length === 0) stop(`no server address given.\n${USAGE}`);
+if (positional.length > 1) stop(`one server address only.\n${USAGE}`);
+let BASE;
+try {
+  const url = new URL(positional[0]);
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error();
+  BASE = url.origin;
+} catch {
+  stop(`"${positional[0]}" isn't an http(s) address.\n${USAGE}`);
+}
+const LOCAL = /^https?:\/\/(127\.0\.0\.1|localhost)(:|$)/.test(BASE);
+
+// node's own .env loader (node 20.12+): it never overrides a variable already set
+const ENV_FILE = path.join(__dirname, '..', '.env');
+try {
+  process.loadEnvFile(ENV_FILE);
+} catch (err) {
+  if (err.code !== 'ENOENT') stop(`couldn't read ${ENV_FILE}: ${err.message}`);
+}
+
 const JWT_SECRET = process.env.REALTIME_JWT_SECRET;
 const INTERNAL = process.env.INTERNAL_SHARED_SECRET;
-if (!JWT_SECRET || !INTERNAL)
-  throw new Error('set REALTIME_JWT_SECRET and INTERNAL_SHARED_SECRET');
+const missing = [
+  !JWT_SECRET && 'REALTIME_JWT_SECRET',
+  !INTERNAL && 'INTERNAL_SHARED_SECRET',
+].filter(Boolean);
+if (missing.length)
+  stop(`${missing.join(' and ')} not set: add to ${ENV_FILE} or set in the terminal`);
+
+console.log(`testing ${BASE}\n`);
 
 // an HS256 token the server's verifyRealtimeToken accepts, valid for 60s
 const b64 = (v) => Buffer.from(JSON.stringify(v)).toString('base64url');
@@ -91,6 +139,15 @@ function probe(headers) {
 }
 
 (async () => {
+  if (RATE_LIMIT_FLAG && !LOCAL) {
+    console.warn(
+      `WARNING  --rate-limit against ${BASE}: at the end of this run that server refuses\n` +
+        '         every new connection from your ip for about a minute (this site, the app, and\n' +
+        '         anyone sharing your connection). ctrl+c within 5 seconds to stop.\n',
+    );
+    await wait(5_000);
+  }
+
   const owner = `test-owner-${crypto.randomUUID()}`;
   const payload = (busyUntil) => ({
     consultantId: owner,
@@ -183,9 +240,8 @@ function probe(headers) {
 
   guest.disconnect();
 
-  // 9. the rate limit follows the right-most x-forwarded-for entry. local servers only: behind
-  // the load balancer that entry is the tester's real ip, appended by the balancer
-  if (/^https?:\/\/(127\.0\.0\.1|localhost)(:|\/|$)/.test(BASE)) {
+  // 9. the rate limit follows the right-most x-forwarded-for entry
+  if (LOCAL) {
     const n = () => Math.floor(Math.random() * 250) + 1;
     const limited = `203.0.113.${n()}`;
     const probes = [];
@@ -200,8 +256,28 @@ function probe(headers) {
     check('another right-most ip still connects', !other.refused);
 
     for (const p of [...probes, over, other]) p.s.disconnect();
+  } else if (RATE_LIMIT_FLAG) {
+    // behind the load balancer the right-most entry is our real ip, appended by the balancer,
+    // so every probe counts against it whatever header we send. this run's earlier
+    // connections count too, so the refusal comes at or before the 21st probe
+    const probes = [];
+    let refusedAt = 0;
+    for (let i = 1; i <= 25 && !refusedAt; i++) {
+      const p = await probe({});
+      probes.push(p);
+      if (p.refused) refusedAt = i;
+    }
+    check('this ip is refused after 20 connections in a minute', refusedAt > 0 && refusedAt <= 21, `refused at probe ${refusedAt || 'none of 25'}`);
+
+    // a faked left-most entry must not reset the count
+    const spoofed = await probe({ 'x-forwarded-for': '6.6.6.6' });
+    probes.push(spoofed);
+    check('a faked x-forwarded-for is still refused', spoofed.refused);
+
+    for (const p of probes) p.s.disconnect();
+    console.log('\nyour ip is rate limited on this server for about a minute');
   } else {
-    console.log('SKIP  rate limit by x-forwarded-for (not a local server)');
+    console.log('SKIP  rate limit by x-forwarded-for (not a local server; --rate-limit runs it)');
   }
 
   console.log(failed ? `\n${failed} FAILED` : '\nall passed');
