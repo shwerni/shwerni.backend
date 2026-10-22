@@ -65,19 +65,24 @@ export class RealtimeGateway
       return;
     }
 
-    const ip = clientIp(socket.handshake);
-    if (!this.rateLimiter.allow(ip)) {
-      this.logger.warn(`rejected ${socket.id}: rate limited (ip: ${ip})`);
-      socket.disconnect(true);
-      return;
-    }
-
     const token = socket.handshake.auth?.token as string | undefined;
     this.logger.log(
       `verifying token for ${socket.id}: ${token ? 'present' : 'missing'}`,
     );
 
     const payload = await verifyRealtimeToken(token);
+
+    // the bucket comes from the verified role: guests, and connections without a valid token,
+    // count apart from USER / OWNER, so they can never use up a consultant's or app user's limit
+    const ip = clientIp(socket.handshake);
+    const bucket = payload && payload.role !== 'GUEST' ? 'member' : 'guest';
+    if (!this.rateLimiter.allow(ip, bucket)) {
+      this.logger.warn(
+        `rejected ${socket.id}: rate limited (ip: ${ip}, ${bucket})`,
+      );
+      socket.disconnect(true);
+      return;
+    }
 
     if (!payload) {
       this.logger.warn(`rejected ${socket.id}: invalid or expired token`);

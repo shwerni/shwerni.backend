@@ -44,4 +44,32 @@ describe('ConnectionRateLimiter', () => {
     expect(limiter['attempts'].has('1.1.1.1')).toBe(false);
     expect(limiter['attempts'].has('2.2.2.2')).toBe(true);
   });
+
+  it('allows 120 guests a minute per ip', () => {
+    for (let i = 0; i < 120; i++)
+      expect(limiter.allow('1.1.1.1', 'guest')).toBe(true);
+    expect(limiter.allow('1.1.1.1', 'guest')).toBe(false);
+
+    jest.advanceTimersByTime(60_000);
+    expect(limiter.allow('1.1.1.1', 'guest')).toBe(true);
+  });
+
+  it('guests and members on one ip have separate windows', () => {
+    for (let i = 0; i < 120; i++) limiter.allow('1.1.1.1', 'guest');
+    expect(limiter.allow('1.1.1.1', 'guest')).toBe(false);
+    expect(limiter.allow('1.1.1.1', 'member')).toBe(true);
+
+    for (let i = 0; i < 20; i++) limiter.allow('2.2.2.2');
+    expect(limiter.allow('2.2.2.2')).toBe(false);
+    expect(limiter.allow('2.2.2.2', 'guest')).toBe(true);
+  });
+
+  it('drops guest ips that stopped connecting too', () => {
+    limiter.allow('1.1.1.1', 'guest');
+    jest.advanceTimersByTime(60_000);
+    limiter.allow('2.2.2.2', 'guest');
+
+    expect(limiter['guestAttempts'].has('1.1.1.1')).toBe(false);
+    expect(limiter['guestAttempts'].has('2.2.2.2')).toBe(true);
+  });
 });

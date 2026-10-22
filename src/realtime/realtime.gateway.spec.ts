@@ -169,9 +169,72 @@ describe('RealtimeGateway connection rate limit', () => {
 
     await gateway.handleConnection(socket);
 
-    expect(allow).toHaveBeenCalledWith('203.0.113.7');
-    // no token: refused after the limiter, as before
+    // no valid token: counted in the guest bucket, then refused
+    expect(allow).toHaveBeenCalledWith('203.0.113.7', 'guest');
     expect(disconnect).toHaveBeenCalledWith(true);
+  });
+
+  // a connection from one shared ip with the given role; returns whether it was refused
+  async function connectFrom(gateway: RealtimeGateway, role: string | null) {
+    (verifyRealtimeToken as jest.Mock).mockResolvedValueOnce(
+      role ? { userId: `${role}-${Math.random()}`, role } : null,
+    );
+    const disconnect = jest.fn();
+    const socket = {
+      id: 's',
+      data: {},
+      disconnect,
+      join: jest.fn().mockResolvedValue(undefined),
+      handshake: {
+        address: '10.0.0.2',
+        auth: { token: 't' },
+        headers: { 'x-forwarded-for': '203.0.113.9' },
+      },
+    } as unknown as Socket;
+    await gateway.handleConnection(socket);
+    return disconnect.mock.calls.length > 0;
+  }
+
+  it('guests on a shared ip never block consultants or app users', async () => {
+    const gateway = new RealtimeGateway(
+      new InstantRequestService(),
+      new ConnectionRateLimiter(),
+      new PresenceService(),
+    );
+    gateway.server = {
+      to: jest.fn(() => ({ emit: jest.fn() })),
+      sockets: { adapter: { rooms: new Map() }, sockets: new Map() },
+    } as unknown as Server;
+
+    for (let i = 0; i < 120; i++)
+      expect(await connectFrom(gateway, 'GUEST')).toBe(false);
+    expect(await connectFrom(gateway, 'GUEST')).toBe(true);
+    // a missing or invalid token counts as a guest too
+    expect(await connectFrom(gateway, null)).toBe(true);
+
+    expect(await connectFrom(gateway, 'OWNER')).toBe(false);
+    expect(await connectFrom(gateway, 'USER')).toBe(false);
+  });
+
+  it('members keep 20 a minute, and using them up never blocks guests', async () => {
+    const gateway = new RealtimeGateway(
+      new InstantRequestService(),
+      new ConnectionRateLimiter(),
+      new PresenceService(),
+    );
+    gateway.server = {
+      to: jest.fn(() => ({ emit: jest.fn() })),
+      sockets: { adapter: { rooms: new Map() }, sockets: new Map() },
+    } as unknown as Server;
+
+    for (let i = 0; i < 10; i++) {
+      expect(await connectFrom(gateway, 'OWNER')).toBe(false);
+      expect(await connectFrom(gateway, 'USER')).toBe(false);
+    }
+    expect(await connectFrom(gateway, 'USER')).toBe(true);
+    expect(await connectFrom(gateway, 'OWNER')).toBe(true);
+
+    expect(await connectFrom(gateway, 'GUEST')).toBe(false);
   });
 });
 

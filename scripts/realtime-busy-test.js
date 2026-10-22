@@ -11,8 +11,9 @@
  *   node scripts/realtime-busy-test.js https://realtime.shwerni.sa --rate-limit
  *
  * the server address is required. --rate-limit runs the rate-limit check against a server that
- * isn't local too: it uses up this machine's connections for the minute, so the server refuses
- * every connection from your ip (the site, the app, anyone sharing it) for about a minute.
+ * isn't local too: it uses up this machine's guest connections for the minute, so the server
+ * refuses guest connections from your ip (the site's live online list, for anyone sharing it) for
+ * about a minute. consultants and app users on that ip are a separate bucket and keep connecting.
  * without it, that check runs only against 127.0.0.1 / localhost. the secrets come from the repo's .env
  * (REALTIME_JWT_SECRET signs the test tokens, INTERNAL_SHARED_SECRET is the x-internal-secret for
  * /internal/*); a variable already set in the terminal wins over .env. they must match the
@@ -126,11 +127,14 @@ async function busy(body, secret = INTERNAL) {
 const timeout = (promise, ms = 2000) =>
   Promise.race([promise, wait(ms).then(() => null)]);
 
-// a guest connection with extra handshake headers: refused = the server dropped it
-function probe(headers) {
+// a connection with extra handshake headers (a guest unless a role is given):
+// refused = the server dropped it
+function probe(headers, role = 'GUEST') {
+  const userId =
+    role === 'GUEST' ? `guest:${crypto.randomUUID()}` : `test-${role.toLowerCase()}-${crypto.randomUUID()}`;
   return new Promise((resolve) => {
     const s = io(BASE, {
-      auth: { token: token(`guest:${crypto.randomUUID()}`, 'GUEST') },
+      auth: { token: token(userId, role) },
       transports: ['websocket'],
       extraHeaders: headers,
       reconnection: false,
@@ -147,8 +151,8 @@ function probe(headers) {
   if (RATE_LIMIT_FLAG && !LOCAL) {
     console.warn(
       `WARNING  --rate-limit against ${BASE}: at the end of this run that server refuses\n` +
-        '         every new connection from your ip for about a minute (this site, the app, and\n' +
-        '         anyone sharing your connection). ctrl+c within 5 seconds to stop.\n',
+        '         guest connections from your ip for about a minute (the site\'s live online list,\n' +
+        '         for anyone sharing your connection). ctrl+c within 5 seconds to stop.\n',
     );
     await wait(5_000);
   }
@@ -275,42 +279,76 @@ function probe(headers) {
 
   guest.disconnect();
 
-  // 9. the rate limit follows the right-most x-forwarded-for entry
+  // 9. the rate limit follows the right-most x-forwarded-for entry, with separate buckets:
+  // 20 a minute for members (USER / OWNER), 120 for guests, neither able to block the other
   if (LOCAL) {
-    const n = () => Math.floor(Math.random() * 250) + 1;
-    const limited = `203.0.113.${n()}`;
+    // test ips from 198.18.0.0/15 (benchmarking, 131k addresses), each one used once per run, so a
+    // run started within a minute of the last one never meets an ip that run already used up
+    const used = new Set();
+    const n = () => {
+      let ip;
+      do ip = `198.${18 + crypto.randomInt(2)}.${crypto.randomInt(256)}.${crypto.randomInt(1, 255)}`;
+      while (used.has(ip));
+      used.add(ip);
+      return ip;
+    };
+    const limited = n();
     const probes = [];
     for (let i = 0; i < 20; i++)
-      probes.push(await probe({ 'x-forwarded-for': `6.6.6.${i}, ${limited}` }));
-    check('20 connections from one forwarded ip pass', probes.every((p) => !p.refused));
+      probes.push(await probe({ 'x-forwarded-for': `6.6.6.${i}, ${limited}` }, 'USER'));
+    check('members: 20 connections from one forwarded ip pass', probes.every((p) => !p.refused));
 
-    const over = await probe({ 'x-forwarded-for': `7.7.7.7, ${limited}` });
-    check('the 21st is refused, whatever the left-most entry says', over.refused);
+    const over = await probe({ 'x-forwarded-for': `7.7.7.7, ${limited}` }, 'OWNER');
+    check('members: the 21st is refused, whatever the left-most entry says', over.refused);
+    probes.push(over);
 
-    const other = await probe({ 'x-forwarded-for': `${limited}, 198.51.100.${n()}` });
-    check('another right-most ip still connects', !other.refused);
+    const other = await probe({ 'x-forwarded-for': `${limited}, ${n()}` }, 'USER');
+    check('members: another right-most ip still connects', !other.refused);
+    probes.push(other);
 
-    for (const p of [...probes, over, other]) p.s.disconnect();
+    const guestAfterMembers = await probe({ 'x-forwarded-for': limited });
+    check('a guest still connects from an ip whose member limit is used up', !guestAfterMembers.refused);
+    probes.push(guestAfterMembers);
+
+    const shared = n();
+    const guests = [];
+    for (let i = 0; i < 120; i++) guests.push(await probe({ 'x-forwarded-for': shared }));
+    check('guests: 120 connections from one forwarded ip pass', guests.every((p) => !p.refused));
+    const guestOver = await probe({ 'x-forwarded-for': shared });
+    check('guests: the 121st is refused', guestOver.refused);
+    guests.push(guestOver);
+
+    const ownerOnShared = await probe({ 'x-forwarded-for': shared }, 'OWNER');
+    check('a consultant still connects from an ip whose guest limit is used up', !ownerOnShared.refused);
+    const userOnShared = await probe({ 'x-forwarded-for': shared }, 'USER');
+    check('an app user still connects from that ip too', !userOnShared.refused);
+
+    for (const p of [...probes, ...guests, ownerOnShared, userOnShared]) p.s.disconnect();
   } else if (RATE_LIMIT_FLAG) {
     // behind the load balancer the right-most entry is our real ip, appended by the balancer,
-    // so every probe counts against it whatever header we send. this run's earlier
-    // connections count too, so the refusal comes at or before the 21st probe
+    // so every probe counts against it whatever header we send. this run's earlier guest
+    // connections count too, so the refusal comes at or before the 121st guest probe. only the
+    // guest bucket is used up: members (consultants, app users) on this ip are never blocked
     const probes = [];
     let refusedAt = 0;
-    for (let i = 1; i <= 25 && !refusedAt; i++) {
+    for (let i = 1; i <= 125 && !refusedAt; i++) {
       const p = await probe({});
       probes.push(p);
       if (p.refused) refusedAt = i;
     }
-    check('this ip is refused after 20 connections in a minute', refusedAt > 0 && refusedAt <= 21, `refused at probe ${refusedAt || 'none of 25'}`);
+    check('guests from this ip are refused after 120 in a minute', refusedAt > 0 && refusedAt <= 121, `refused at probe ${refusedAt || 'none of 125'}`);
 
     // a faked left-most entry must not reset the count
     const spoofed = await probe({ 'x-forwarded-for': '6.6.6.6' });
     probes.push(spoofed);
     check('a faked x-forwarded-for is still refused', spoofed.refused);
 
+    const member = await probe({}, 'OWNER');
+    probes.push(member);
+    check('a consultant on this ip still connects (separate bucket)', !member.refused);
+
     for (const p of probes) p.s.disconnect();
-    console.log('\nyour ip is rate limited on this server for about a minute');
+    console.log('\nguest connections from your ip are rate limited on this server for about a minute');
   } else {
     console.log('SKIP  rate limit by x-forwarded-for (not a local server; --rate-limit runs it)');
   }
