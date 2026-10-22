@@ -159,6 +159,14 @@ export class RealtimeGateway
       return { online: false, busyUntil: busy.busyUntil };
     }
 
+    // a socket counts once: a second emit would add a reference its disconnect never removes
+    if (data.isOnlineConsultant) {
+      this.logger.log(
+        `consultant-online again from ${socket.id}: already online, not counted`,
+      );
+      return { online: true };
+    }
+
     data.isOnlineConsultant = true;
     const wentOnline = this.presence.markOnline(data.userId);
     this.logger.log(`markOnline(${data.userId}) -> wentOnline=${wentOnline}`);

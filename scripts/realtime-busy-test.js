@@ -1,0 +1,158 @@
+/**
+ * end-to-end check of instant presence on a running realtime server: consultant-online (ack and
+ * the app's no-ack emit), a double emit from one socket, /internal/consultant-busy,
+ * instant-booked, instant-busy, the busy expiry, and disconnects.
+ *
+ * secrets come from env vars only (never write them in this file):
+ *   BASE                    server url, default http://127.0.0.1:4100
+ *   REALTIME_JWT_SECRET     the server's token secret (the script signs its own tokens)
+ *   INTERNAL_SHARED_SECRET  the x-internal-secret for /internal/*
+ *
+ * socket.io-client isn't a dependency of this repo; point NODE_PATH at a node_modules that has
+ * it (the website repo does):
+ *   NODE_PATH=<website>/node_modules BASE=... REALTIME_JWT_SECRET=... INTERNAL_SHARED_SECRET=... \
+ *     node scripts/realtime-busy-test.js
+ *
+ * against production it uses throwaway test-owner-<uuid> ids, but each run blocks that test id
+ * for about 4 seconds and sends presence-changed to every connected client. exits 1 on any failure
+ */
+const crypto = require('crypto');
+const { io } = require('socket.io-client');
+
+const BASE = process.env.BASE || 'http://127.0.0.1:4100';
+const JWT_SECRET = process.env.REALTIME_JWT_SECRET;
+const INTERNAL = process.env.INTERNAL_SHARED_SECRET;
+if (!JWT_SECRET || !INTERNAL)
+  throw new Error('set REALTIME_JWT_SECRET and INTERNAL_SHARED_SECRET');
+
+// an HS256 token the server's verifyRealtimeToken accepts, valid for 60s
+const b64 = (v) => Buffer.from(JSON.stringify(v)).toString('base64url');
+function token(userId, role) {
+  const now = Math.floor(Date.now() / 1000);
+  const body = `${b64({ alg: 'HS256' })}.${b64({ userId, role, iat: now, exp: now + 60 })}`;
+  const sig = crypto
+    .createHmac('sha256', JWT_SECRET)
+    .update(body)
+    .digest('base64url');
+  return `${body}.${sig}`;
+}
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+let failed = 0;
+function check(label, ok, extra = '') {
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${extra ? '  ' + extra : ''}`);
+  if (!ok) failed++;
+}
+
+function connect(userId, role) {
+  return new Promise((resolve, reject) => {
+    const s = io(BASE, {
+      auth: { token: token(userId, role) },
+      transports: ['websocket'],
+    });
+    // let the server finish its async token check before the first emit
+    s.once('connect', () => setTimeout(() => resolve(s), 300));
+    s.once('connect_error', reject);
+  });
+}
+
+async function onlineIds() {
+  return (await (await fetch(`${BASE}/presence/online`)).json()).onlineIds;
+}
+
+async function busy(body, secret = INTERNAL) {
+  const res = await fetch(`${BASE}/internal/consultant-busy`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-internal-secret': secret },
+    body: JSON.stringify(body),
+  });
+  return { status: res.status, json: await res.json().catch(() => null) };
+}
+
+const timeout = (promise, ms = 2000) =>
+  Promise.race([promise, wait(ms).then(() => null)]);
+
+(async () => {
+  const owner = `test-owner-${crypto.randomUUID()}`;
+  const payload = (busyUntil) => ({
+    consultantId: owner,
+    orderId: 4242,
+    meetingId: 'test-mid',
+    meetingUrl: 'https://shwerni.sa/meetings/test-mid?participant=test',
+    startsAt: new Date().toISOString(),
+    duration: 30,
+    busyUntil,
+  });
+
+  // 1. online as today, plus the ack
+  const ownerSocket = await connect(owner, 'OWNER');
+  const guest = await connect(`guest:${crypto.randomUUID()}`, 'GUEST');
+  const ack1 = await ownerSocket.timeout(3000).emitWithAck('consultant-online');
+  check('consultant-online ack', ack1?.online === true, JSON.stringify(ack1));
+  check('listed in /presence/online', (await onlineIds()).includes(owner));
+
+  // 2. a double emit from one socket adds no reference: one disconnect takes it offline
+  const doubler = `test-owner-${crypto.randomUUID()}`;
+  const doubleSocket = await connect(doubler, 'OWNER');
+  const d1 = await doubleSocket.timeout(3000).emitWithAck('consultant-online');
+  const d2 = await doubleSocket.timeout(3000).emitWithAck('consultant-online');
+  doubleSocket.emit('consultant-online'); // and once more the app's way, no ack
+  await wait(300);
+  check('double emit: both acks online', d1?.online === true && d2?.online === true);
+  check('double emit: listed once', (await onlineIds()).filter((id) => id === doubler).length === 1);
+  doubleSocket.disconnect();
+  await wait(500);
+  check('double emit: offline after one disconnect (no ghost)', !(await onlineIds()).includes(doubler));
+
+  // 3. guard and validation
+  check('wrong secret → 401', (await busy(payload(Date.now() + 60_000), 'x'.repeat(INTERNAL.length))).status === 401);
+  check('bad body → 400', (await busy({ consultantId: owner })).status === 400);
+  check('busyUntil in the past → 400', (await busy(payload(Date.now() - 1))).status === 400);
+  check('still listed after refused calls', (await onlineIds()).includes(owner));
+
+  // 4. consultant-busy
+  const booked = new Promise((r) => ownerSocket.once('instant-booked', r));
+  const changed = new Promise((r) => guest.once('presence-changed', r));
+  const busyUntil = Date.now() + 4_000;
+  const res = await busy(payload(busyUntil));
+  check('consultant-busy → 201 { ok, wasOnline: true }', res.status === 201 && res.json?.ok && res.json?.wasOnline === true, JSON.stringify(res));
+  const bookedPayload = await timeout(booked);
+  check('owner got instant-booked (no consultantId in it)', bookedPayload?.orderId === 4242 && bookedPayload?.busyUntil === busyUntil && !('consultantId' in bookedPayload), JSON.stringify(bookedPayload));
+  const changedPayload = await timeout(changed);
+  check('guest got presence-changed online:false', changedPayload?.consultantId === owner && changedPayload?.online === false, JSON.stringify(changedPayload));
+  check('not listed after busy', !(await onlineIds()).includes(owner));
+
+  // 5. consultant-online while busy: refused, with ack and instant-busy
+  const busyEvt = new Promise((r) => ownerSocket.once('instant-busy', r));
+  const ack2 = await ownerSocket.timeout(3000).emitWithAck('consultant-online');
+  check('refused ack { online:false, busyUntil }', ack2?.online === false && ack2?.busyUntil === busyUntil, JSON.stringify(ack2));
+  const busyPayload = await timeout(busyEvt);
+  check('instant-busy received', busyPayload?.orderId === 4242 && busyPayload?.busyUntil === busyUntil, JSON.stringify(busyPayload));
+  ownerSocket.emit('consultant-online'); // the app's way: no ack
+  await wait(500);
+  check('no-ack emit while busy stays offline', !(await onlineIds()).includes(owner));
+
+  // 6. a new connection while busy (reconnect, second tab) is refused too
+  const second = await connect(owner, 'OWNER');
+  const ack3 = await second.timeout(3000).emitWithAck('consultant-online');
+  check('second socket refused while busy', ack3?.online === false, JSON.stringify(ack3));
+
+  // 7. after busyUntil: online again, the app's no-ack emit works as today
+  await wait(Math.max(0, busyUntil - Date.now()) + 300);
+  second.emit('consultant-online');
+  await wait(500);
+  check('online again after busyUntil (no-ack emit)', (await onlineIds()).includes(owner));
+
+  // 8. disconnect leaves no ghost
+  second.disconnect();
+  ownerSocket.disconnect();
+  await wait(500);
+  check('offline after disconnect', !(await onlineIds()).includes(owner));
+
+  guest.disconnect();
+  console.log(failed ? `\n${failed} FAILED` : '\nall passed');
+  process.exit(failed ? 1 : 0);
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
