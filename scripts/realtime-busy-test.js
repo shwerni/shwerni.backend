@@ -177,6 +177,30 @@ function probe(headers) {
   const guestCounts = await guest.timeout(3000).emitWithAck('get-presence-counts');
   check('get-presence-counts as GUEST → { counts: null }', guestCounts !== null && guestCounts.counts === null, JSON.stringify(guestCounts));
 
+  // presence-changed: counts for owner sockets only, one event per socket per change
+  const flipper = `test-owner-${crypto.randomUUID()}`;
+  const watcher = await connect(`test-owner-${crypto.randomUUID()}`, 'OWNER');
+  const client = await connect(`test-user-${crypto.randomUUID()}`, 'USER');
+  const flip = await connect(flipper, 'OWNER');
+  const seen = { watcher: [], client: [], guest: [], flipper: [] };
+  const record = (key) => (p) => {
+    if (p?.consultantId === flipper) seen[key].push(p);
+  };
+  watcher.on('presence-changed', record('watcher'));
+  client.on('presence-changed', record('client'));
+  guest.on('presence-changed', record('guest'));
+  flip.on('presence-changed', record('flipper'));
+  await flip.timeout(3000).emitWithAck('consultant-online');
+  await wait(500);
+  check('owner socket: one presence-changed, with counts', seen.watcher.length === 1 && !!seen.watcher[0].counts, JSON.stringify(seen.watcher));
+  check('the consultant itself: one presence-changed, with counts', seen.flipper.length === 1 && !!seen.flipper[0].counts, JSON.stringify(seen.flipper));
+  check('client socket: one presence-changed, no counts', seen.client.length === 1 && !('counts' in seen.client[0]), JSON.stringify(seen.client));
+  check('guest socket: one presence-changed, no counts', seen.guest.length === 1 && !('counts' in seen.guest[0]), JSON.stringify(seen.guest));
+  flip.disconnect();
+  watcher.disconnect();
+  client.disconnect();
+  await wait(300);
+
   // 2. a double emit from one socket adds no reference: one disconnect takes it offline
   const doubler = `test-owner-${crypto.randomUUID()}`;
   const doubleSocket = await connect(doubler, 'OWNER');

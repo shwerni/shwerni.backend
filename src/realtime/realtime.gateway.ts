@@ -22,7 +22,10 @@ import type {
   InstantRequestBroadcast,
   InstantResponseBroadcast,
 } from './dto/instant-request.dto.js';
-import type { PresenceChangedBroadcast } from './dto/presence.dto.js';
+import type {
+  PresenceChangedBroadcast,
+  PublicPresenceChangedBroadcast,
+} from './dto/presence.dto.js';
 import type {
   InstantBookedBroadcast,
   InstantBusyBroadcast,
@@ -33,6 +36,8 @@ import { clientIp } from './client-ip.js';
 
 const INSTANT_REQUEST_TIMEOUT_MS = 30_000;
 const PUBLIC_ROOM = 'public-presence';
+// every owner socket: the only ones that get the live connection counts
+const OWNERS_ROOM = 'owners';
 
 @WebSocketGateway({
   cors: { origin: corsOrigin },
@@ -92,8 +97,10 @@ export class RealtimeGateway
     this.logger.log(`${socket.id} joined ${PUBLIC_ROOM}`);
 
     if (payload.role === 'OWNER') {
-      await socket.join(`user:${payload.userId}`);
-      this.logger.log(`${socket.id} joined user:${payload.userId}`);
+      await socket.join([`user:${payload.userId}`, OWNERS_ROOM]);
+      this.logger.log(
+        `${socket.id} joined user:${payload.userId} and ${OWNERS_ROOM}`,
+      );
     }
 
     // record a daily stats snapshot now that this socket is counted in the room
@@ -294,13 +301,23 @@ export class RealtimeGateway
     return { owners, clients, guests, total: owners + clients + guests };
   }
 
+  // counts go to owners only; everyone else gets the event without them. an owner is in both
+  // rooms, so the public send leaves the owners room out: one event per socket per change
   private broadcastPresence(consultantId: string, online: boolean) {
-    this.server.to(PUBLIC_ROOM).emit('presence-changed', {
+    const change = {
       consultantId,
       online,
       onlineCount: this.presence.getOnlineIds().length,
+    } satisfies PublicPresenceChangedBroadcast;
+
+    this.server.to(OWNERS_ROOM).emit('presence-changed', {
+      ...change,
       counts: this.getConnectionCounts(),
     } satisfies PresenceChangedBroadcast);
+    this.server
+      .to(PUBLIC_ROOM)
+      .except(OWNERS_ROOM)
+      .emit('presence-changed', change);
   }
 
   @SubscribeMessage('chat-message')

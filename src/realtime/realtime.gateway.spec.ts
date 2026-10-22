@@ -22,7 +22,7 @@ import { ConnectionRateLimiter } from './connection-rate-limiter';
 function fakeServer() {
   const emit = jest.fn();
   return {
-    to: jest.fn(() => ({ emit })),
+    to: jest.fn(() => ({ emit, except: jest.fn(() => ({ emit })) })),
     sockets: { adapter: { rooms: new Map() }, sockets: new Map() },
   } as unknown as Server;
 }
@@ -217,5 +217,106 @@ describe('RealtimeGateway get-presence-counts', () => {
     expect(gateway.getPresenceCounts(socketWithRole('GUEST'))).toEqual({
       counts: null,
     });
+  });
+});
+
+describe('RealtimeGateway presence-changed', () => {
+  // records every send: the room, the room left out (if any), the event and its payload
+  function recordingServer() {
+    const sends: {
+      to: string;
+      except: string | null;
+      event: string;
+      payload: Record<string, unknown>;
+    }[] = [];
+    const server = {
+      to: (to: string) => ({
+        emit: (event: string, payload: Record<string, unknown>) =>
+          sends.push({ to, except: null, event, payload }),
+        except: (except: string) => ({
+          emit: (event: string, payload: Record<string, unknown>) =>
+            sends.push({ to, except, event, payload }),
+        }),
+      }),
+      sockets: { adapter: { rooms: new Map() }, sockets: new Map() },
+    } as unknown as Server;
+    return { server, sends };
+  }
+
+  it('owners get counts, everyone else the same change without them, once each', async () => {
+    const gateway = new RealtimeGateway(
+      new InstantRequestService(),
+      new ConnectionRateLimiter(),
+      new PresenceService(),
+    );
+    const { server, sends } = recordingServer();
+    gateway.server = server;
+
+    await gateway.onConsultantOnline(ownerSocket('s1', 'owner-1'));
+
+    const changes = sends.filter((s) => s.event === 'presence-changed');
+    expect(changes).toHaveLength(2);
+
+    const toOwners = changes.find((s) => s.to === 'owners');
+    expect(toOwners?.except).toBeNull();
+    expect(toOwners?.payload).toEqual({
+      consultantId: 'owner-1',
+      online: true,
+      onlineCount: 1,
+      counts: { owners: 0, clients: 0, guests: 0, total: 0 },
+    });
+
+    // the public send leaves the owners room out, so no owner gets it twice
+    const toPublic = changes.find((s) => s.to === 'public-presence');
+    expect(toPublic?.except).toBe('owners');
+    expect(toPublic?.payload).toEqual({
+      consultantId: 'owner-1',
+      online: true,
+      onlineCount: 1,
+    });
+    expect(toPublic?.payload).not.toHaveProperty('counts');
+  });
+
+  it('only owner sockets join the owners room', async () => {
+    const gateway = new RealtimeGateway(
+      new InstantRequestService(),
+      new ConnectionRateLimiter(),
+      new PresenceService(),
+    );
+    gateway.server = recordingServer().server;
+
+    const joined: Record<string, string[]> = {};
+    const connectAs = async (role: string) => {
+      (verifyRealtimeToken as jest.Mock).mockResolvedValueOnce({
+        userId: `${role}-1`,
+        role,
+      });
+      joined[role] = [];
+      const socket = {
+        id: role,
+        data: {},
+        disconnect: jest.fn(),
+        join: jest.fn((rooms: string | string[]) => {
+          joined[role].push(...([] as string[]).concat(rooms));
+          return Promise.resolve();
+        }),
+        handshake: {
+          address: `10.0.0.${role.length}`,
+          auth: { token: 't' },
+          headers: {},
+        },
+      } as unknown as Socket;
+      await gateway.handleConnection(socket);
+    };
+
+    await connectAs('OWNER');
+    await connectAs('USER');
+    await connectAs('GUEST');
+
+    expect(joined.OWNER).toEqual(
+      expect.arrayContaining(['public-presence', 'user:OWNER-1', 'owners']),
+    );
+    expect(joined.USER).toEqual(['public-presence']);
+    expect(joined.GUEST).toEqual(['public-presence']);
   });
 });
