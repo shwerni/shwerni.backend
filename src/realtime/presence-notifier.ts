@@ -10,9 +10,9 @@ export async function notifyPresenceChange(
   online: boolean,
 ) {
   const url = `${NEXT_INTERNAL_URL}/api/internal/presence`;
-  console.log(
-    `[presence-notifier] calling ${url} for ${consultantId} online=${online}`,
-  );
+  // console.log(
+  //   `[presence-notifier] calling ${url} for ${consultantId} online=${online}`,
+  // );
 
   try {
     const res = await fetch(url, {
