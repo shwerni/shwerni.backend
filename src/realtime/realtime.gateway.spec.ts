@@ -1,5 +1,6 @@
 // packages
 import type { Server, Socket } from 'socket.io';
+import { MESSAGE_METADATA } from '@nestjs/websockets/constants';
 
 // the notifiers call next.js and the token check loads jose: neither runs here
 jest.mock('./presence-notifier.js', () => ({
@@ -381,5 +382,35 @@ describe('RealtimeGateway presence-changed', () => {
     );
     expect(joined.USER).toEqual(['public-presence']);
     expect(joined.GUEST).toEqual(['public-presence']);
+  });
+});
+
+describe('RealtimeGateway client events', () => {
+  // every event name a client can emit, read from the @SubscribeMessage metadata
+  const subscribed = () => {
+    const proto = RealtimeGateway.prototype as unknown as Record<
+      string,
+      unknown
+    >;
+    return Object.getOwnPropertyNames(proto)
+      .map((name) => proto[name])
+      .filter((method) => typeof method === 'function')
+      .map((method) => Reflect.getMetadata(MESSAGE_METADATA, method) as unknown)
+      .filter((message): message is string => typeof message === 'string')
+      .sort();
+  };
+
+  it('no client can broadcast chat-message to a room', () => {
+    expect(subscribed()).not.toContain('chat-message');
+  });
+
+  it('the client events are exactly the known ones', () => {
+    expect(subscribed()).toEqual([
+      'consultant-offline',
+      'consultant-online',
+      'get-online-consultants',
+      'get-presence-counts',
+      'instant-response',
+    ]);
   });
 });

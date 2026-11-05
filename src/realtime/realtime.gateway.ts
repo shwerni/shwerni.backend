@@ -324,17 +324,4 @@ export class RealtimeGateway
       .except(OWNERS_ROOM)
       .emit('presence-changed', change);
   }
-
-  @SubscribeMessage('chat-message')
-  onChatMessage(
-    @ConnectedSocket() socket: Socket,
-    @MessageBody() payload: { roomId: string; text: string },
-  ) {
-    const data = socket.data as SocketData;
-    this.server.to(payload.roomId).emit('chat-message', {
-      senderId: data.userId,
-      text: payload.text,
-      sentAt: Date.now(),
-    });
-  }
 }

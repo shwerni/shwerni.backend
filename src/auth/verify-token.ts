@@ -1,13 +1,14 @@
 // packages
 import { jwtVerify } from 'jose';
 
-export type RealtimePayload = {
-  userId: string;
-  role: 'USER' | 'OWNER' | 'GUEST';
-};
+// utils
+import { toRealtimePayload } from './realtime-claims.js';
+
+export type { RealtimePayload } from './realtime-claims.js';
 
 /**
- * verifies a short lived token minted by next.js, guests included
+ * verifies a short lived token minted by next.js, guests included. a valid signature isn't
+ * enough: the claims must be a connection token's (no audience, a known role, a user id)
  */
 export async function verifyRealtimeToken(token: string | undefined) {
   if (!token) return null;
@@ -20,7 +21,10 @@ export async function verifyRealtimeToken(token: string | undefined) {
   try {
     const secret = new TextEncoder().encode(process.env.REALTIME_JWT_SECRET);
     const { payload } = await jwtVerify(token, secret);
-    return payload as RealtimePayload;
+
+    const realtime = toRealtimePayload(payload);
+    if (!realtime) console.error('[verify-token] not a connection token');
+    return realtime;
   } catch (error) {
     console.error(
       '[verify-token] verification failed:',
