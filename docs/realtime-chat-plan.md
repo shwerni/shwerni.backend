@@ -225,7 +225,7 @@ Where the plan below departs from the website, and why:
 
 - **Faster:** photos are resized to 1080px JPEG before upload (`pickPhoto`, already in the app).
 - **Simpler:** the app's session replaces the participant token; the app never handles participant tokens.
-- **Safer, not faster or simpler:** the send route takes a signed attachment token instead of a raw `fileUrl`. On the website a browser can send any URL as `fileUrl`. Confirm this departure when feature 3 starts, or replicate the website's raw `fileUrl`.
+- **Safer (decided by Ziad 2026-11-09):** the send route takes a signed attachment token instead of a raw `fileUrl`. On the website a browser can send any URL as `fileUrl`. The website side of this is backlog item W1 (section 11).
 
 ### Next.js work
 
@@ -244,7 +244,7 @@ Where the plan below departs from the website, and why:
   - verify `attachment` (audience, expiry, `sub` = this user, `mid` = this chat), then pass `fileUrl/fileType/fileName` from the token to `createMeetingMessage`.
   - The app never sends a raw URL, so nobody can attach a file they didn't upload to this chat.
   - Existing text-only requests stay valid.
-- **No change to the website router or the website action.** Website backlog note: the website action takes `fileUrl` from the browser unchecked.
+- **No change to the website router or the website action.** The website action takes `fileUrl` from the browser unchecked: backlog item W1 (section 11).
 
 ### App work
 
@@ -367,6 +367,11 @@ Each step is shippable alone and changes nothing for the users of the previous o
 - **D6:** cleanup later.
 - **D7:** yes, as a follow-up after feature 1.
 
+**Later (2026-11-09):**
+
+- **Feature 3:** build from the website's chat files, improving only where the app gets faster or simpler.
+- **Feature 3 attachments:** keep the signed attachment token. It's safer than the website's plain `fileUrl`, so it's the one departure that isn't about speed or simplicity.
+
 The options as they were put:
 
 - **D1.** Rooms per meeting and per side, joined with a ticket (as asked, and as planned here). The alternative is delivering to each user's own `user:{id}` room with no join step: simpler, and it also updates the chat list live, but there's no "this chat is open" signal for feature 4. **Recommended: per-meeting rooms as planned.**
@@ -382,3 +387,12 @@ The options as they were put:
 - The website chat: it keeps polling and gets no socket. It does benefit from fixes 3 and 4 in feature 2, and its messages reach the app live.
 - Typing indicators, read ticks, replying from the notification (the spec's decision stands), and pleading-case chats (`OrderMessage.pleadingId`).
 - Moving the online list and instant presence onto the shared socket.
+
+## 11. Website backlog from this plan
+
+The website backlog lives in the app repo (`shwerni-app/docs/progress.md`, "Website backlog (high priority)", items 1-22 as of 2026-11-09). This repo's sessions can't edit that file, so these items are copied there by hand.
+
+- **W1 (proposed #23): website chat: accept only files uploaded to that chat.**
+  - **The problem:** the website's `createMeetingMessage` action (`actions/site.ts` → `data/chats.ts`) saves whatever `fileUrl`, `fileType` and `fileName` the browser sends. A participant could post a message that links to any URL, not only a file uploaded through `chatAttachment` for that meeting.
+  - **Fix:** use the app's approach (feature 3). The `chatAttachment` upload returns a signed attachment token (audience `chat-attachment`, the meeting, the file's url / type / name, 30 minutes). The action accepts that token instead of the raw fields and takes the file from it.
+  - Found 2026-11-09 (realtime chat plan, feature 3).
