@@ -20,7 +20,11 @@
  * server under test. the values are never printed, and never belong in this file.
  *
  * against production it uses throwaway test-owner-<uuid> ids, but each run blocks that test id
- * for about 6 seconds and sends presence-changed to every connected client. exits 1 on any failure
+ * for about 9 seconds and sends presence-changed to every connected client. exits 1 on any failure
+ *
+ * the server decides "past" and "expired" by its own clock, this script by the machine's. the
+ * time checks keep CLOCK_MARGIN_MS of room for the two to differ, and the measured difference is
+ * printed at the start (with a warning when it's bigger than the margin)
  */
 const crypto = require('crypto');
 const path = require('path');
@@ -88,6 +92,38 @@ function token(userId, role) {
 }
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// how far this machine's clock may be from the server's before the time checks go wrong
+const CLOCK_MARGIN_MS = 3_000;
+
+// the server's clock minus this machine's, from the Date header (whole seconds): requests back to
+// back until the server's second ticks over, so the tick lies between two answers. null without
+// an answer that has a usable Date header
+async function clockOffset() {
+  let prev = null;
+  const deadline = Date.now() + 3_000;
+  while (Date.now() < deadline) {
+    const sent = Date.now();
+    const res = await fetch(`${BASE}/`, { cache: 'no-store' }).catch(() => null);
+    const got = Date.now();
+    if (!res) return null;
+    await res.arrayBuffer().catch(() => null);
+    const date = Date.parse(res.headers.get('date') ?? '');
+    if (!Number.isFinite(date)) return null;
+
+    const mid = (sent + got) / 2;
+    if (prev && date > prev.date) {
+      // the server's clock read `date` between the two answers
+      return {
+        offset: Math.round(date - (prev.mid + mid) / 2),
+        error: Math.round((got - prev.sent) / 2),
+      };
+    }
+    prev = { date, sent, mid };
+  }
+  return null;
+}
+
 let failed = 0;
 function check(label, ok, extra = '') {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${label}${extra ? '  ' + extra : ''}`);
@@ -157,6 +193,20 @@ function probe(headers, role = 'GUEST') {
     await wait(5_000);
   }
 
+  const clock = await clockOffset();
+  if (!clock) console.log('clock: no answer with a usable Date header, the difference is unknown\n');
+  else {
+    const sign = clock.offset > 0 ? '+' : '';
+    console.log(
+      `clock: server − this machine = ${sign}${clock.offset} ms (±${clock.error} ms, from the server's Date header)\n`,
+    );
+    if (Math.abs(clock.offset) + clock.error > CLOCK_MARGIN_MS)
+      console.warn(
+        `WARNING  the clocks may differ by more than the test's ${CLOCK_MARGIN_MS} ms margin: the busy checks\n` +
+          '         can fail on this machine. sync its clock, or run from a synced one.\n',
+      );
+  }
+
   const owner = `test-owner-${crypto.randomUUID()}`;
   const payload = (busyUntil) => ({
     consultantId: owner,
@@ -221,7 +271,7 @@ function probe(headers, role = 'GUEST') {
   // 3. guard and validation
   check('wrong secret → 401', (await busy(payload(Date.now() + 60_000), 'x'.repeat(INTERNAL.length))).status === 401);
   check('bad body → 400', (await busy({ consultantId: owner })).status === 400);
-  check('busyUntil in the past → 400', (await busy(payload(Date.now() - 1))).status === 400);
+  check('busyUntil a minute in the past → 400', (await busy(payload(Date.now() - 60_000))).status === 400);
   check('no secret → 401', (await busy(payload(Date.now() + 60_000), '')).status === 401);
   check('a secret of the same length in more bytes → 401 (not 500)', (await busy(payload(Date.now() + 60_000), 'é'.repeat(INTERNAL.length))).status === 401);
   check('duration the site does not sell → 400', (await busy({ ...payload(Date.now() + 60_000), duration: 40 })).status === 400);
@@ -232,7 +282,8 @@ function probe(headers, role = 'GUEST') {
   // 4. consultant-busy
   const booked = new Promise((r) => ownerSocket.once('instant-booked', r));
   const changed = new Promise((r) => guest.once('presence-changed', r));
-  const busyUntil = Date.now() + 6_000;
+  // 6s of test plus the clock margin: the shorter second booking (5b) must still be ahead on the server
+  const busyUntil = Date.now() + 6_000 + CLOCK_MARGIN_MS;
   const res = await busy(payload(busyUntil));
   check('consultant-busy → 201 { ok, wasOnline: true }', res.status === 201 && res.json?.ok && res.json?.wasOnline === true, JSON.stringify(res));
   const bookedPayload = await timeout(booked);
@@ -265,8 +316,8 @@ function probe(headers, role = 'GUEST') {
   const ack3 = await second.timeout(3000).emitWithAck('consultant-online');
   check('second socket refused while busy', ack3?.online === false, JSON.stringify(ack3));
 
-  // 7. after busyUntil: online again, the app's no-ack emit works as today
-  await wait(Math.max(0, busyUntil - Date.now()) + 300);
+  // 7. after busyUntil (on the server's clock too): online again, the app's no-ack emit works as today
+  await wait(Math.max(0, busyUntil - Date.now()) + CLOCK_MARGIN_MS);
   second.emit('consultant-online');
   await wait(500);
   check('online again after busyUntil (no-ack emit)', (await onlineIds()).includes(owner));
