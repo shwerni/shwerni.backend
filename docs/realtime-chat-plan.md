@@ -1,6 +1,6 @@
 # Realtime chat for the app: plan
 
-- **status:** approved by Ziad 2026-11-05, with the decisions in section 9. Step 1a (the security fix) is built; the rest waits, because the Next.js side has other work first.
+- **status:** approved by Ziad 2026-11-05, with the decisions in section 9. Step 1a (the security fix, `988bcc5`) is deployed; the rest waits, because the Next.js side has other work first.
 - **priority:** the app. The website chat stays as it is (it keeps polling every 7s), but it gains nothing it must change for.
 - **repos:** this server (`shwerni.backend`), the main site and mobile API (`shwerni.vercel/shwerni.sa`, "Next.js"), the app (`shwerni.app/shwerni-app`).
 - **builds on:** the chat work in the Next.js repo that is still uncommitted (`data/chats.ts`, `lib/notifications/mobile/notify/chat.ts`). It should be committed before this starts.
@@ -328,7 +328,7 @@ app (client or consultant)                        Next.js                       
 Each step is shippable alone and changes nothing for the users of the previous one.
 
 1. **Realtime server, in two pushes:**
-   - **1a, the live security fix, deployed first on its own:** S1 (the open `chat-message` handler removed) and S2 (connection tokens refuse an audience, an unknown role or a missing user id). Done 2026-11-05.
+   - **1a, the live security fix, deployed first on its own:** S1 (the open `chat-message` handler removed) and S2 (connection tokens refuse an audience, an unknown role or a missing user id). Built 2026-11-05 (`988bcc5`), deployed 2026-11-09.
    - **1b:** S3, S4, `chat-join` / `chat-leave`, the internal chat routes, peer presence, tests, and the end-to-end script. Nothing calls the new parts yet.
 2. **Next.js A:** the send timing logs (feature 2, measure), the AI timeout, and running the AI in parallel. Measure for a few days.
 3. **Next.js B:** the ticket routes, `scheduleChatPublish` in `createMeetingMessage`, the refresh after a block, and `nonce`. The app keeps polling until step 4.
