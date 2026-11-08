@@ -212,6 +212,21 @@ app (client or consultant)                        Next.js                       
 
 ## 5. Feature 3: images and files in the app
 
+### Start from the website (Ziad, 2026-11-09)
+
+The website chat already sends images and files in production. Build the app's version by replicating the website's, and improve only where it makes the app faster or simpler. Read these first:
+
+- **upload and validation:** UploadThing `chatAttachment` in `app/api/uploadthing/core.ts` (image up to 8MB, PDF up to 16MB, one file, the uploader must be a participant of the meeting);
+- **send:** `components/clients/chats/chat.tsx` uploads first (`startUpload` with `{ mid, participant }`), then calls `createMeetingMessage` with `fileUrl` (`ufsUrl`), `fileType` and `fileName`;
+- **storage:** the file stays in UploadThing; `OrderMessage` keeps only `fileUrl`, `fileType` and `fileName`;
+- **display:** `components/clients/chats/bubble.tsx`, `attachment-preview.tsx` (before sending) and `file-preview.tsx` (in the thread).
+
+Where the plan below departs from the website, and why:
+
+- **Faster:** photos are resized to 1080px JPEG before upload (`pickPhoto`, already in the app).
+- **Simpler:** the app's session replaces the participant token; the app never handles participant tokens.
+- **Safer, not faster or simpler:** the send route takes a signed attachment token instead of a raw `fileUrl`. On the website a browser can send any URL as `fileUrl`. Confirm this departure when feature 3 starts, or replicate the website's raw `fileUrl`.
+
 ### Next.js work
 
 - **Upload route** `chatAttachment` in `app/api/uploadthing/mobile/core.ts`:
