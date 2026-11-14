@@ -33,6 +33,8 @@ import type {
 import { notifyInstantSnapshot } from './instant-snapshot-notifier.js';
 import { corsOrigin } from '../allowed-origins.js';
 import { clientIp } from './client-ip.js';
+import { AppPresenceService } from './chat/app-presence.service.js';
+import { peerKey, watchRoom } from './chat/peer-key.js';
 
 const INSTANT_REQUEST_TIMEOUT_MS = 30_000;
 const PUBLIC_ROOM = 'public-presence';
@@ -59,6 +61,7 @@ export class RealtimeGateway
     private readonly instantRequests: InstantRequestService,
     private readonly rateLimiter: ConnectionRateLimiter,
     private readonly presence: PresenceService,
+    private readonly appPresence: AppPresenceService = new AppPresenceService(),
   ) {}
 
   async handleConnection(socket: Socket) {
@@ -113,6 +116,7 @@ export class RealtimeGateway
     if (isAppConnection(socket, payload.role)) {
       data.purpose = 'app';
       this.logger.log(`${socket.id} is an app connection`);
+      this.trackAppSocket(socket);
       return;
     }
 
@@ -133,11 +137,46 @@ export class RealtimeGateway
     }
   }
 
+  /**
+   * a consultant's app socket: its last packet time is kept (a killed app's last seen is its last
+   * pong, not the ping timeout), and their first open app socket announces "online" to the client
+   * chats watching them. a client's status is never tracked (decision D4)
+   */
+  private trackAppSocket(socket: Socket) {
+    const data = socket.data as SocketData;
+    if (data.role !== 'OWNER') return;
+
+    const key = peerKey(data.userId);
+    if (!key) return;
+
+    data.peerKey = key;
+    data.lastActiveAt = Date.now();
+    socket.conn?.on('packet', () => {
+      data.lastActiveAt = Date.now();
+    });
+
+    if (this.appPresence.connect(key)) this.announcePeer(key);
+  }
+
+  // every client chat watching this consultant hears their status
+  private announcePeer(key: string) {
+    this.server
+      .to(watchRoom(key))
+      .emit('peer-presence', { key, ...this.appPresence.state(key) });
+  }
+
   async handleDisconnect(socket: Socket) {
     const data = socket.data as SocketData;
     this.logger.log(
       `disconnected: ${socket.id} (userId=${data.userId ?? 'unknown'})`,
     );
+
+    // a consultant's last app socket closed: "آخر ظهور" from its last packet
+    if (data.purpose === 'app' && data.peerKey) {
+      const lastActiveAt = data.lastActiveAt ?? Date.now();
+      if (this.appPresence.disconnect(data.peerKey, lastActiveAt))
+        this.announcePeer(data.peerKey);
+    }
 
     if (data.role === 'OWNER' && data.isOnlineConsultant) {
       const wentOffline = this.presence.markOffline(data.userId);

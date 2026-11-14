@@ -18,14 +18,24 @@ import {
   toChatJoin,
   type ChatSide,
 } from './chat-claims.js';
+import { AppPresenceService } from './app-presence.service.js';
+import { watchRoom } from './peer-key.js';
 import type { ChatDelivery, ChatRefresh } from './chat-message.js';
 import type { SocketData } from '../types/socket-data.js';
 
 // a socket follows at most this many chats at once
 const MAX_CHAT_ROOMS = 20;
 
+// the consultant's status as the client's chat header shows it
+export interface ChatPeer {
+  key: string;
+  online: boolean;
+  // epoch ms, null when unknown
+  lastSeenAt: number | null;
+}
+
 export type ChatJoinAck =
-  | { ok: true; mid: string; peer: null }
+  | { ok: true; mid: string; peer: ChatPeer | null }
   | { ok: false; error: 'expired' | 'invalid' | 'limit' };
 
 /**
@@ -41,6 +51,10 @@ export class ChatGateway {
   @WebSocketServer() server!: Server;
 
   private readonly logger = new Logger(ChatGateway.name);
+
+  constructor(
+    private readonly appPresence: AppPresenceService = new AppPresenceService(),
+  ) {}
 
   // the return value is the ack
   @SubscribeMessage('chat-join')
@@ -79,7 +93,27 @@ export class ChatGateway {
     }
 
     this.logger.log(`${socket.id} joined ${room}`);
-    return { ok: true, mid: join.mid, peer: null };
+    if (!join.peer) return { ok: true, mid: join.mid, peer: null };
+
+    // a client's chat: it hears this consultant's peer-presence from now on
+    const data = socket.data as SocketData;
+    data.chatPeers = { ...data.chatPeers, [join.mid]: join.peer.key };
+    await socket.join(watchRoom(join.peer.key));
+
+    const state = this.appPresence.state(join.peer.key);
+    const lastSeenAt = Math.max(
+      state.lastSeenAt ?? 0,
+      join.peer.lastSeenAt ?? 0,
+    );
+    return {
+      ok: true,
+      mid: join.mid,
+      peer: {
+        key: join.peer.key,
+        online: state.online,
+        lastSeenAt: lastSeenAt || null,
+      },
+    };
   }
 
   @SubscribeMessage('chat-leave')
@@ -93,6 +127,15 @@ export class ChatGateway {
     if (role !== 'USER' && role !== 'OWNER') return { ok: false };
 
     await socket.leave(chatRoom(mid, role));
+
+    // the peer's watch room goes once no other joined chat watches the same consultant
+    const data = socket.data as SocketData;
+    const key = data.chatPeers?.[mid];
+    if (key && data.chatPeers) {
+      delete data.chatPeers[mid];
+      if (!Object.values(data.chatPeers).includes(key))
+        await socket.leave(watchRoom(key));
+    }
     return { ok: true };
   }
 

@@ -2,7 +2,8 @@
  * end-to-end check of the app's live chat on a running realtime server: app connections kept out
  * of the counts, chat-join with signed tickets (signature, audience, issuer, expiry, age, user,
  * role, meeting, the app connection only, the room limit), POST /internal/chat-message and
- * /internal/chat-refresh (secret, body, each side's own room), chat-leave and reconnects.
+ * /internal/chat-refresh (secret, body, each side's own room), chat-leave and reconnects, and the
+ * consultant's "متصل الآن" / "آخر ظهور" (peer-presence, only to a client's joined chat).
  *
  * run from the repo root, in any terminal, after npm install:
  *   node scripts/realtime-chat-test.js http://127.0.0.1:4000
@@ -69,6 +70,10 @@ function jwt(claims, { secret = JWT_SECRET, alg = 'HS256' } = {}) {
 // a join ticket as next.js mints it
 const ticket = (sub, mid, side, extra = {}, options) =>
   jwt({ sub, mid, side, aud: 'chat-join', iss: 'shwerni-next', ...extra }, options);
+
+// a user's opaque presence key, as next.js computes it for a ticket's peer claim
+const peerKey = (userId) =>
+  crypto.createHmac('sha256', JWT_SECRET).update(`peer:${userId}`).digest('hex').slice(0, 16);
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 let failed = 0;
@@ -229,6 +234,58 @@ const message = (mine, extra = {}) => ({
   for (let i = 0; i < 20; i++) if ((await join(busy, `lim${i}`, ticket(busyId, `lim${i}`, 'USER'))).ok) joined++;
   check('20 chats per socket', joined === 20);
   await refused('the 21st chat', busy, 'lim20', ticket(busyId, 'lim20', 'USER'), 'limit');
+
+  // 8. "متصل الآن" / "آخر ظهور": only a client's chat watches its consultant (D4)
+  const consultantId = id('consultant');
+  const watcherId = id('watcher');
+  const strangerId = id('stranger');
+  const pmid = newMid();
+  const key = peerKey(consultantId);
+  const ticketLastSeen = Date.now() - 3_600_000;
+
+  const watcher = await connect(watcherId, 'USER');
+  const stranger = await connect(strangerId, 'USER');
+  const atWatcher = record(watcher, 'peer-presence');
+  const atStranger = record(stranger, 'peer-presence');
+
+  const ack = await join(watcher, pmid, ticket(watcherId, pmid, 'USER', { peer: key, peerLastSeenAt: ticketLastSeen }));
+  check('the join ack has the consultant offline, last seen from the ticket (UserPresence)', ack?.ok && ack.peer?.key === key && ack.peer.online === false && ack.peer.lastSeenAt === ticketLastSeen, JSON.stringify(ack));
+
+  const instantSocket = await connect(consultantId, 'OWNER', { app: false });
+  await wait(300);
+  check('the consultant\'s instant socket alone changes nothing', atWatcher.length === 0, JSON.stringify(atWatcher));
+
+  const consultantApp = await connect(consultantId, 'OWNER');
+  const atConsultant = record(consultantApp, 'peer-presence');
+  await wait(300);
+  check('the consultant opens the app → the client hears "online"', atWatcher.length === 1 && atWatcher[0].key === key && atWatcher[0].online === true, JSON.stringify(atWatcher));
+
+  const ownerAck = await join(consultantApp, pmid, ticket(consultantId, pmid, 'OWNER', { peer: peerKey(watcherId), peerLastSeenAt: Date.now() }));
+  check('the consultant\'s join never watches the client, whatever its ticket says', ownerAck?.ok === true && ownerAck.peer === null, JSON.stringify(ownerAck));
+
+  const secondWatcher = await connect(watcherId, 'USER');
+  const lateAck = await join(secondWatcher, pmid, ticket(watcherId, pmid, 'USER', { peer: key }));
+  check('a client joining while the consultant has the app open sees "online"', lateAck?.peer?.online === true, JSON.stringify(lateAck));
+
+  // the client's own app coming and going is never announced to the consultant
+  const clientAppAgain = await connect(watcherId, 'USER');
+  clientAppAgain.disconnect();
+
+  const closedAt = Date.now();
+  consultantApp.disconnect();
+  await wait(500);
+  const offline = atWatcher[1];
+  check('the consultant closes the app → the client hears offline, last seen just now', atWatcher.length === 2 && offline?.online === false && Math.abs(offline.lastSeenAt - closedAt) < 5_000, JSON.stringify(atWatcher));
+  check('a client that never joined that chat heard nothing', atStranger.length === 0, JSON.stringify(atStranger));
+  check('the consultant\'s socket never got a client\'s status', atConsultant.length === 0, JSON.stringify(atConsultant));
+  check('no user id in any peer-presence or ack', ![JSON.stringify(atWatcher), JSON.stringify(ack), JSON.stringify(lateAck)].some((text) => text.includes(consultantId) || text.includes(watcherId)));
+
+  const afterClose = await join(stranger, newMid(), ticket(strangerId, 'pm2', 'USER', { peer: key, peerLastSeenAt: ticketLastSeen }));
+  check('refused: a ticket for another meeting, even with a peer', afterClose?.ok === false);
+  const strangerMid = newMid();
+  const memoryAck = await join(stranger, strangerMid, ticket(strangerId, strangerMid, 'USER', { peer: key, peerLastSeenAt: ticketLastSeen }));
+  check('after a close, this server\'s last seen beats an older ticket', memoryAck?.peer?.online === false && memoryAck.peer.lastSeenAt === offline?.lastSeenAt, JSON.stringify(memoryAck));
+  instantSocket.disconnect();
 
   for (const s of opened) s.disconnect();
   console.log(failed ? `\n${failed} FAILED` : '\nall passed');

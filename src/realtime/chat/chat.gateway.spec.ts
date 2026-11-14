@@ -9,6 +9,7 @@ jest.mock('./chat-ticket.js', () => ({ verifyChatTicket: jest.fn() }));
 // utils
 import { verifyChatTicket } from './chat-ticket.js';
 import { ChatGateway } from './chat.gateway';
+import { AppPresenceService } from './app-presence.service';
 
 const verify = verifyChatTicket as jest.Mock;
 
@@ -166,6 +167,83 @@ describe('ChatGateway chat-join', () => {
     expect(await gateway.onChatLeave(socket, { mid: 'bad/mid' })).toEqual({
       ok: false,
     });
+  });
+});
+
+describe('ChatGateway peer (only the client sees the consultant, D4)', () => {
+  const key = '0123456789abcdef';
+  let presence: AppPresenceService;
+  let gateway: ChatGateway;
+
+  beforeEach(() => {
+    presence = new AppPresenceService();
+    gateway = new ChatGateway(presence);
+    gateway.server = recordingServer().server;
+    verify.mockReset();
+  });
+
+  const clientJoin = (socket: Socket, mid: string, peerLastSeenAt?: number) => {
+    verify.mockResolvedValueOnce({
+      claims: { sub: 'client-1', mid, side: 'USER', peer: key, peerLastSeenAt },
+    });
+    return gateway.onChatJoin(socket, { mid, ticket: 't' });
+  };
+
+  it("a client's join watches the consultant and gets their status", async () => {
+    presence.connect(key);
+    const socket = appSocket('client-1', 'USER');
+
+    expect(await clientJoin(socket, 'm1')).toEqual({
+      ok: true,
+      mid: 'm1',
+      peer: { key, online: true, lastSeenAt: null },
+    });
+    expect(socket.rooms.has(`watch:${key}`)).toBe(true);
+  });
+
+  it('last seen is the later of this server and the ticket (UserPresence)', async () => {
+    presence.connect(key);
+    presence.disconnect(key, 5_000, 5_000);
+    const socket = appSocket('client-1', 'USER');
+
+    // the ticket's time is older: this server's wins
+    expect(await clientJoin(socket, 'm1', 1_000)).toMatchObject({
+      peer: { online: false, lastSeenAt: 5_000 },
+    });
+    // the ticket's time is newer (e.g. after a restart): the ticket's wins
+    expect(await clientJoin(socket, 'm2', 9_000)).toMatchObject({
+      peer: { online: false, lastSeenAt: 9_000 },
+    });
+  });
+
+  it("a consultant's join never watches anyone, whatever its ticket claims", async () => {
+    verify.mockResolvedValueOnce({
+      claims: { sub: 'owner-1', mid: 'm1', side: 'OWNER', peer: key },
+    });
+    const socket = appSocket('owner-1', 'OWNER');
+
+    expect(
+      await gateway.onChatJoin(socket, { mid: 'm1', ticket: 't' }),
+    ).toEqual({
+      ok: true,
+      mid: 'm1',
+      peer: null,
+    });
+    expect([...socket.rooms].some((room) => room.startsWith('watch:'))).toBe(
+      false,
+    );
+  });
+
+  it('leaving one chat keeps the watch while another chat with that consultant is open', async () => {
+    const socket = appSocket('client-1', 'USER');
+    await clientJoin(socket, 'm1');
+    await clientJoin(socket, 'm2');
+
+    await gateway.onChatLeave(socket, { mid: 'm1' });
+    expect(socket.rooms.has(`watch:${key}`)).toBe(true);
+
+    await gateway.onChatLeave(socket, { mid: 'm2' });
+    expect(socket.rooms.has(`watch:${key}`)).toBe(false);
   });
 });
 

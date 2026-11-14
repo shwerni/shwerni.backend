@@ -457,6 +457,111 @@ describe('RealtimeGateway app connections', () => {
   });
 });
 
+describe('RealtimeGateway peer presence (consultants only, D4)', () => {
+  const saved = process.env.REALTIME_JWT_SECRET;
+  beforeAll(() => {
+    process.env.REALTIME_JWT_SECRET = 'test-secret';
+  });
+  afterAll(() => {
+    if (saved === undefined) delete process.env.REALTIME_JWT_SECRET;
+    else process.env.REALTIME_JWT_SECRET = saved;
+  });
+
+  // one gateway; every emit recorded with its room
+  function setup() {
+    const sends: { room: string; event: string; payload: unknown }[] = [];
+    const gateway = new RealtimeGateway(
+      new InstantRequestService(),
+      new ConnectionRateLimiter(),
+      new PresenceService(),
+    );
+    gateway.server = {
+      to: (room: string) => ({
+        emit: (event: string, payload: unknown) =>
+          sends.push({ room, event, payload }),
+      }),
+      sockets: { adapter: { rooms: new Map() }, sockets: new Map() },
+    } as unknown as Server;
+
+    // an app socket of this user; packet() simulates a packet from the phone
+    const appSocket = async (userId: string, role: string) => {
+      (verifyRealtimeToken as jest.Mock).mockResolvedValueOnce({
+        userId,
+        role,
+      });
+      let onPacket = () => {};
+      const socket = {
+        id: `${userId}-socket`,
+        data: {},
+        disconnect: jest.fn(),
+        join: jest.fn().mockResolvedValue(undefined),
+        conn: { on: (_event: string, fn: () => void) => (onPacket = fn) },
+        handshake: {
+          address: '10.0.0.8',
+          auth: { token: 't', purpose: 'app' },
+          headers: {},
+        },
+      } as unknown as Socket;
+      await gateway.handleConnection(socket);
+      return { socket, packet: () => onPacket() };
+    };
+
+    return { gateway, sends, appSocket };
+  }
+
+  const presenceSends = (sends: { event: string }[]) =>
+    sends.filter((s) => s.event === 'peer-presence');
+
+  it("a consultant's app announces online under their key, never their id", async () => {
+    const { sends, appSocket } = setup();
+    const { socket } = await appSocket('owner-1', 'OWNER');
+    const key = (socket.data as { peerKey: string }).peerKey;
+
+    expect(key).toMatch(/^[0-9a-f]{16}$/);
+    expect(presenceSends(sends)).toEqual([
+      {
+        room: `watch:${key}`,
+        event: 'peer-presence',
+        payload: { key, online: true, lastSeenAt: null },
+      },
+    ]);
+    expect(JSON.stringify(sends)).not.toContain('owner-1');
+  });
+
+  it("a client's app announces nothing and gets no key", async () => {
+    const { sends, appSocket } = setup();
+    const { socket } = await appSocket('client-1', 'USER');
+
+    expect(socket.data).not.toHaveProperty('peerKey');
+    expect(presenceSends(sends)).toEqual([]);
+  });
+
+  it('offline when the last app socket closes, last seen = its last packet', async () => {
+    jest.useFakeTimers({ now: 1_000_000 });
+    const { gateway, sends, appSocket } = setup();
+    const phone = await appSocket('owner-1', 'OWNER');
+    const tablet = await appSocket('owner-1', 'OWNER');
+
+    jest.setSystemTime(1_010_000);
+    phone.packet();
+    jest.setSystemTime(1_020_000);
+    tablet.packet();
+
+    jest.setSystemTime(1_030_000);
+    await gateway.handleDisconnect(tablet.socket);
+    expect(presenceSends(sends)).toHaveLength(1); // the phone is still open
+
+    // the phone was killed: noticed at the ping timeout, 45s after its last packet
+    jest.setSystemTime(1_055_000);
+    await gateway.handleDisconnect(phone.socket);
+    jest.useRealTimers();
+
+    expect(presenceSends(sends).at(-1)).toMatchObject({
+      payload: { online: false, lastSeenAt: 1_010_000 },
+    });
+  });
+});
+
 describe('RealtimeGateway client events', () => {
   // every event name a client can emit, read from the @SubscribeMessage metadata
   const subscribed = () => {

@@ -20,6 +20,7 @@ describe('toChatJoin', () => {
     expect(toChatJoin(clientTicket, client, 'mid_AB-12')).toEqual({
       mid: 'mid_AB-12',
       side: 'USER',
+      peer: null,
     });
   });
 
@@ -27,6 +28,7 @@ describe('toChatJoin', () => {
     expect(toChatJoin(ownerTicket, owner, 'mid_AB-12')).toEqual({
       mid: 'mid_AB-12',
       side: 'OWNER',
+      peer: null,
     });
   });
 
@@ -97,5 +99,59 @@ describe('toChatJoin', () => {
   it('names one room per meeting and side', () => {
     expect(chatRoom('m1', 'USER')).toBe('chat:m1:USER');
     expect(chatRoom('m1', 'OWNER')).toBe('chat:m1:OWNER');
+  });
+
+  describe('the peer (only the client sees the consultant, D4)', () => {
+    const now = Date.parse('2026-11-14T12:00:00Z');
+    const key = '0123456789abcdef';
+
+    it("a client's ticket brings the consultant's key and last seen", () => {
+      expect(
+        toChatJoin(
+          { ...clientTicket, peer: key, peerLastSeenAt: now - 60_000 },
+          client,
+          'mid_AB-12',
+          now,
+        )?.peer,
+      ).toEqual({ key, lastSeenAt: now - 60_000 });
+    });
+
+    it("a consultant's ticket never brings a peer, whatever it claims", () => {
+      expect(
+        toChatJoin(
+          { ...ownerTicket, peer: key, peerLastSeenAt: now },
+          owner,
+          'mid_AB-12',
+          now,
+        ),
+      ).toEqual({ mid: 'mid_AB-12', side: 'OWNER', peer: null });
+    });
+
+    it.each([
+      ['a key that is not 16 hex characters', 'not-a-key'],
+      ['an uppercase key', key.toUpperCase()],
+      ['a user id', 'client-1'],
+      ['no key', undefined],
+    ])('%s: no peer, the chat still joins', (_label, peer) => {
+      expect(
+        toChatJoin({ ...clientTicket, peer }, client, 'mid_AB-12', now),
+      ).toEqual({ mid: 'mid_AB-12', side: 'USER', peer: null });
+    });
+
+    it.each([
+      ['in the future', now + 120_000],
+      ['not a number', '2026-11-14'],
+      ['zero', 0],
+      ['missing', undefined],
+    ])('a last seen %s is unknown (null)', (_label, peerLastSeenAt) => {
+      expect(
+        toChatJoin(
+          { ...clientTicket, peer: key, peerLastSeenAt },
+          client,
+          'mid_AB-12',
+          now,
+        )?.peer,
+      ).toEqual({ key, lastSeenAt: null });
+    });
   });
 });
