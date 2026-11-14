@@ -1,6 +1,6 @@
 # Realtime chat for the app: plan
 
-- **status:** approved by Ziad 2026-11-05, with the decisions in section 9. Step 1a (the security fix, `988bcc5`) is deployed; the rest waits, because the Next.js side has other work first.
+- **status:** approved by Ziad 2026-11-05, with the decisions in section 9. Step 1a (the security fix, `988bcc5`) is deployed. Step 1b (this server's whole part) is built and committed, not deployed: see section 12 for the exact contract the Next.js side calls.
 - **priority:** the app. The website chat stays as it is (it keeps polling every 7s), but it gains nothing it must change for.
 - **repos:** this server (`shwerni.backend`), the main site and mobile API (`shwerni.vercel/shwerni.sa`, "Next.js"), the app (`shwerni.app/shwerni-app`).
 - **builds on:** the chat work in the Next.js repo that is still uncommitted (`data/chats.ts`, `lib/notifications/mobile/notify/chat.ts`). It should be committed before this starts.
@@ -90,11 +90,11 @@ app (client or consultant)                        Next.js                       
 | what | direction | payload |
 |---|---|---|
 | room `chat:{mid}:USER` / `chat:{mid}:OWNER` | — | one room per meeting and per side, so each side gets its own view (`mine`, blocks) |
-| `chat-join` (ack) | app → server | `{ ticket }` → ack `{ ok: true, mid, peer }` or `{ ok: false, error: "expired" \| "invalid" \| "limit" }`. `peer` is part of feature 4 |
+| `chat-join` (ack) | app → server | `{ mid, ticket }` (as built: `mid` is required and must match the ticket) → ack `{ ok: true, mid, peer }` or `{ ok: false, error: "expired" \| "invalid" \| "limit" }`. `peer` is part of feature 4 |
 | `chat-leave` | app → server | `{ mid }` |
 | `chat-message` | server → room | `{ mid, message: ChatMessage }`, where `ChatMessage` is exactly the app's type: `{ id, content, mine, at, file, blocked }`, plus an optional `nonce` on the sender's side |
 | `chat-refresh` | server → room | `{ mid }`: refetch the thread (the consultant's side after a block or unblock) |
-| `POST /internal/chat-message` | Next.js → server | `{ mid, client: ChatMessage \| null, owner: (ChatMessage & { nonce? }) \| null }` → `{ ok, delivered: { client: n, owner: n } }` |
+| `POST /internal/chat-message` | Next.js → server | `{ mid, client: ChatMessage \| null, owner: ChatMessage \| null }`, with `nonce` only on the sender's side (as built: either side) → `{ ok, delivered: { client: n, owner: n } }` |
 | `POST /internal/chat-refresh` | Next.js → server | `{ mid, side: "USER" \| "OWNER" }` |
 
 ### Realtime server work
@@ -288,7 +288,7 @@ Where the plan below departs from the website, and why:
 
 ### Realtime server work
 
-- **Track app users:** a count of open `purpose: "app"` sockets per `userId` (USER and OWNER), and `lastSeen` per user, set when the count drops to 0.
+- **Track app users:** a count of open `purpose: "app"` sockets per user, and `lastSeen` per user, set when the count drops to 0. As built, after D4: consultants only, keyed by their peer key; a client's status is never tracked.
   - Both maps are in memory.
   - `lastSeen` entries older than 7 days are dropped once an hour.
 - **Peers are known only by an opaque key:** `peerKey = HMAC-SHA256(REALTIME_JWT_SECRET, "peer:" + userId)`, first 16 hex characters. Next.js computes the same key and puts it in the join ticket, so the app never sees a user id.
@@ -344,7 +344,7 @@ Each step is shippable alone and changes nothing for the users of the previous o
 
 1. **Realtime server, in two pushes:**
    - **1a, the live security fix, deployed first on its own:** S1 (the open `chat-message` handler removed) and S2 (connection tokens refuse an audience, an unknown role or a missing user id). Built 2026-11-05 (`988bcc5`), deployed 2026-11-09.
-   - **1b:** S3, S4, `chat-join` / `chat-leave`, the internal chat routes, peer presence, tests, and the end-to-end script. Nothing calls the new parts yet.
+   - **1b:** S3, S4, `chat-join` / `chat-leave`, the internal chat routes, peer presence, tests, and the end-to-end script. Nothing calls the new parts yet. Built 2026-11-14 (`b6764fb`, `cedab60`, `8b6c280`, `5e576aa`), not deployed; the contract is in section 12.
 2. **Next.js A:** the send timing logs (feature 2, measure), the AI timeout, and running the AI in parallel. Measure for a few days.
 3. **Next.js B:** the ticket routes, `scheduleChatPublish` in `createMeetingMessage`, the refresh after a block, and `nonce`. The app keeps polling until step 4.
 4. **App A:** the shared socket, `use-chat-live`, the optimistic send with `setQueryData`, and the slower poll while live.
@@ -396,3 +396,104 @@ The website backlog lives in the app repo (`shwerni-app/docs/progress.md`, "Webs
   - **The problem:** the website's `createMeetingMessage` action (`actions/site.ts` → `data/chats.ts`) saves whatever `fileUrl`, `fileType` and `fileName` the browser sends. A participant could post a message that links to any URL, not only a file uploaded through `chatAttachment` for that meeting.
   - **Fix:** use the app's approach (feature 3). The `chatAttachment` upload returns a signed attachment token (audience `chat-attachment`, the meeting, the file's url / type / name, 30 minutes). The action accepts that token instead of the raw fields and takes the file from it.
   - Found 2026-11-09 (realtime chat plan, feature 3).
+
+## 12. Built on this server: the contract to call (step 1b, 2026-11-14)
+
+Commits `b6764fb` (member rate limit per user), `cedab60` (app connections), `8b6c280` (chat rooms), `5e576aa` (the consultant's status). They are committed, not pushed. Nothing calls the new parts until Next.js does, so this server can be deployed first.
+
+### Next.js: the join ticket (`GET /api/mobile/chats/{mid}/realtime`, `GET /api/mobile/owner/chats/{mid}/realtime`)
+
+Answer `{ ticket }`, after the same access checks as the thread GET, and 404 once the chat is closed:
+
+```ts
+import { SignJWT } from "jose";
+import { createHmac } from "crypto";
+
+const secret = new TextEncoder().encode(process.env.REALTIME_JWT_SECRET);
+
+// the consultant's opaque presence key; never send a user id to the app
+const peerKey = (userId: string) =>
+  createHmac("sha256", process.env.REALTIME_JWT_SECRET!)
+    .update(`peer:${userId}`)
+    .digest("hex")
+    .slice(0, 16);
+
+const ticket = await new SignJWT({
+  mid,                       // the meeting id from the url
+  side,                      // "USER" on the client route, "OWNER" on the owner route
+  // client route only, when the consultant has a user (not a center consultant):
+  peer: peerKey(consultantUserId),
+  peerLastSeenAt: userPresence?.lastSeenAt.getTime() ?? null, // epoch ms
+})
+  .setProtectedHeader({ alg: "HS256" })
+  .setSubject(userId)        // the signed-in user
+  .setAudience("chat-join")
+  .setIssuer("shwerni-next")
+  .setIssuedAt()
+  .setExpirationTime("60s")
+  .sign(secret);
+```
+
+- `side` must be the role in the same user's connection token, which `/api/mobile/realtime-token` maps to OWNER for a consultant and USER for everyone else. So the owner route is for consultants and the client route for clients.
+- The owner ticket carries no `peer` / `peerLastSeenAt`. This server ignores them on an OWNER ticket anyway (D4).
+- This server refuses the join (`invalid`) unless all of these hold:
+  - the signature, audience, issuer and age (at most 60s, 5s clock tolerance) check out;
+  - `sub` is the socket's user;
+  - `side` is the socket's role;
+  - `mid` matches `^[A-Za-z0-9_-]{1,32}$` and is the meeting the socket asked for;
+  - the socket is an app connection.
+
+  An expired ticket answers `expired`.
+
+### Next.js: after a message is saved (`createMeetingMessage`)
+
+`POST {BACKEND_URL}/internal/chat-message` with the header `x-internal-secret: INTERNAL_SHARED_SECRET`:
+
+```json
+{
+  "mid": "<meeting id>",
+  "client": { "id": "…", "content": "…", "mine": true, "at": "2026-11-14T10:00:00.000Z", "file": null, "blocked": false, "nonce": "<sender's nonce, optional>" },
+  "owner":  { "id": "…", "content": "…", "mine": false, "at": "2026-11-14T10:00:00.000Z", "file": null, "blocked": false }
+}
+```
+
+- **`client`:** `toChatMessage(row, USER)`, or `null` for a block marker.
+- **`owner`:** `toChatMessage(row, OWNER)`, or `null` when the meeting is blocked and the client sent it.
+- **`nonce`:** 1-64 characters, on the sender's side only.
+- **Limits:**
+  - `id` ≤ 64 characters;
+  - `content` ≤ 10,000 characters (the website sets no cap);
+  - text or a file, or both;
+  - `file` is `null` or `{ url: "https://…" (≤ 2048), name: string | null (≤ 255), type: string | null (≤ 100) };
+  - at least one side not null.
+- **Unknown fields** are dropped.
+- **Answers:**
+  - `201 { ok: true, delivered: { client, owner } }`: the number of sockets in each side's room, where 0 means nobody has that chat open live;
+  - `400` for a bad body;
+  - `401` without the secret.
+- **Call it like `consultant-busy`:** in `after()`, with a 2s timeout, never throwing, and only logged on failure. Polling and the push cover a miss.
+
+`POST {BACKEND_URL}/internal/chat-refresh` with `{ "mid": "…", "side": "OWNER" }` and the same header answers `201 { ok: true, delivered: n }`. Call it after `toggleUserBlock`, to the OWNER side only.
+
+### The app (its later steps)
+
+- **Connect** the shared socket with `auth: { token, purpose: "app" }`. It isn't counted in the instant numbers, and `consultant-online` is refused on it; the instant screens keep their own sockets.
+- **`chat-join { mid, ticket }`** (with an ack) answers one of:
+  - `{ ok: true, mid, peer: { key, online, lastSeenAt } | null }`;
+  - `{ ok: false, error: "expired" | "invalid" | "limit" }`.
+
+  On `expired`, fetch a new ticket and retry once. After every reconnect, join again with a fresh ticket.
+- **`chat-leave { mid }`**.
+- **Events:**
+  - `chat-message { mid, message }`;
+  - `chat-refresh { mid }`;
+  - `peer-presence { key, online, lastSeenAt }`, on the client side only.
+- **Times:** `lastSeenAt` is epoch ms, or null when unknown.
+
+### Limits and behaviour
+
+- **Chats:** at most 20 per socket.
+- **Connections:** members (USER / OWNER) 20 a minute per user and 300 a minute per IP; guests 120 a minute per IP. This is the one change current clients see: a member's limit was 20 a minute per IP.
+- **Consultant status:** online from their first app socket to their last. Last seen is the last packet from the last one, kept in memory for 7 days. When this server knows nothing newer, the ticket's `peerLastSeenAt` (UserPresence) is used.
+- **One instance:** everything is in memory, on one instance.
+- **Check a running server:** `node scripts/realtime-chat-test.js <url>` (46 checks) and `node scripts/realtime-busy-test.js <url>`. Both read the secrets from `.env`.
