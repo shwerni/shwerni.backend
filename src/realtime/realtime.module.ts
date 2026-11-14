@@ -8,14 +8,17 @@ import { PresenceController } from './presence.controller';
 import { InstantRequestService } from './instant-request.service';
 import { ConnectionRateLimiter } from './connection-rate-limiter';
 import { PresenceService } from './presence.service';
+import { ChatGateway } from './chat/chat.gateway';
+import { ChatInternalController } from './chat/chat-internal.controller';
 
 @Module({
-  controllers: [InternalController, PresenceController],
+  controllers: [InternalController, PresenceController, ChatInternalController],
   providers: [
     RealtimeGateway,
     InstantRequestService,
     ConnectionRateLimiter,
     PresenceService,
+    ChatGateway,
   ],
 })
 export class RealtimeModule {}
