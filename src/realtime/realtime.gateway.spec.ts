@@ -15,6 +15,7 @@ jest.mock('../auth/verify-token.js', () => ({
 
 // utils
 import { verifyRealtimeToken } from '../auth/verify-token.js';
+import { notifyInstantSnapshot } from './instant-snapshot-notifier.js';
 import { RealtimeGateway } from './realtime.gateway';
 import { PresenceService } from './presence.service';
 import { InstantRequestService } from './instant-request.service';
@@ -387,6 +388,72 @@ describe('RealtimeGateway presence-changed', () => {
     );
     expect(joined.USER).toEqual(['public-presence']);
     expect(joined.GUEST).toEqual(['public-presence']);
+  });
+});
+
+describe('RealtimeGateway app connections', () => {
+  // connects one socket with the given role and handshake purpose; returns it and its rooms
+  async function connect(role: string, purpose?: unknown) {
+    const presence = new PresenceService();
+    const gateway = new RealtimeGateway(
+      new InstantRequestService(),
+      new ConnectionRateLimiter(),
+      presence,
+    );
+    gateway.server = fakeServer();
+    (verifyRealtimeToken as jest.Mock).mockResolvedValueOnce({
+      userId: `${role}-app`,
+      role,
+    });
+    const rooms: string[] = [];
+    const socket = {
+      id: 'app-1',
+      data: {},
+      emit: jest.fn(),
+      disconnect: jest.fn(),
+      join: jest.fn((joined: string | string[]) => {
+        rooms.push(...([] as string[]).concat(joined));
+        return Promise.resolve();
+      }),
+      handshake: {
+        address: '10.0.0.7',
+        auth: { token: 't', purpose },
+        headers: {},
+      },
+    } as unknown as Socket;
+    (notifyInstantSnapshot as jest.Mock).mockClear();
+    await gateway.handleConnection(socket);
+    return { gateway, presence, socket, rooms };
+  }
+
+  it.each(['USER', 'OWNER'])(
+    'a %s app socket joins no instant room and records no snapshot',
+    async (role) => {
+      const { socket, rooms } = await connect(role, 'app');
+      expect(socket.data).toMatchObject({ purpose: 'app', role });
+      expect(rooms).toEqual([]);
+      expect(notifyInstantSnapshot).not.toHaveBeenCalled();
+    },
+  );
+
+  it('an owner app socket never goes online or gets the counts', async () => {
+    const { gateway, presence, socket } = await connect('OWNER', 'app');
+    expect(await gateway.onConsultantOnline(socket)).toEqual({ online: false });
+    expect(presence.getOnlineIds()).toEqual([]);
+    expect(gateway.getPresenceCounts(socket)).toEqual({ counts: null });
+  });
+
+  it('a guest token never becomes an app socket', async () => {
+    const { socket, rooms } = await connect('GUEST', 'app');
+    expect(socket.data).not.toHaveProperty('purpose');
+    expect(rooms).toEqual(['public-presence']);
+  });
+
+  it('any other purpose is an ordinary socket, as today', async () => {
+    const { socket, rooms } = await connect('OWNER', 'chat');
+    expect(socket.data).not.toHaveProperty('purpose');
+    expect(rooms).toEqual(['public-presence', 'user:OWNER-app', 'owners']);
+    expect(notifyInstantSnapshot).toHaveBeenCalled();
   });
 });
 

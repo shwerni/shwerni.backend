@@ -39,6 +39,12 @@ const PUBLIC_ROOM = 'public-presence';
 // every owner socket: the only ones that get the live connection counts
 const OWNERS_ROOM = 'owners';
 
+// the app's shared socket asks for it with auth.purpose "app"; a guest token never gets it
+const isAppConnection = (socket: Socket, role: SocketData['role']) =>
+  role !== 'GUEST' &&
+  (socket.handshake.auth as { purpose?: unknown } | undefined)?.purpose ===
+    'app';
+
 @WebSocketGateway({
   cors: { origin: corsOrigin },
 })
@@ -102,6 +108,14 @@ export class RealtimeGateway
     data.userId = payload.userId;
     data.role = payload.role;
 
+    // the app's shared socket (signed-in users only): no instant rooms, counts or snapshot, so
+    // an open app changes nothing in the consultant dashboard numbers or the next.js load
+    if (isAppConnection(socket, payload.role)) {
+      data.purpose = 'app';
+      this.logger.log(`${socket.id} is an app connection`);
+      return;
+    }
+
     await socket.join(PUBLIC_ROOM);
     this.logger.log(`${socket.id} joined ${PUBLIC_ROOM}`);
 
@@ -150,6 +164,14 @@ export class RealtimeGateway
     if (data.role !== 'OWNER') {
       this.logger.warn(
         `ignored consultant-online: ${socket.id} is not an OWNER`,
+      );
+      return { online: false };
+    }
+
+    // the instant presence has its own socket; the app's shared one never counts as online
+    if (data.purpose === 'app') {
+      this.logger.warn(
+        `ignored consultant-online: ${socket.id} is an app connection`,
       );
       return { online: false };
     }
@@ -277,13 +299,13 @@ export class RealtimeGateway
   }
 
   // live connection counts for the consultant dashboard, replacing the public GET /presence/counts.
-  // owners only; every other socket gets { counts: null }, so the ack always arrives
+  // owners' instant sockets only; every other socket (the app's shared one included) gets
+  // { counts: null }, so the ack always arrives
   @SubscribeMessage('get-presence-counts')
   getPresenceCounts(@ConnectedSocket() socket: Socket) {
     const data = socket.data as SocketData;
-    return {
-      counts: data.role === 'OWNER' ? this.getConnectionCounts() : null,
-    };
+    const instantOwner = data.role === 'OWNER' && data.purpose !== 'app';
+    return { counts: instantOwner ? this.getConnectionCounts() : null };
   }
 
   /**
