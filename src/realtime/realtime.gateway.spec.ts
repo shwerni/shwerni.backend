@@ -148,7 +148,7 @@ describe('RealtimeGateway markConsultantBusy', () => {
 describe('RealtimeGateway connection rate limit', () => {
   it('limits by the right-most x-forwarded-for entry, not the load balancer', async () => {
     const limiter = new ConnectionRateLimiter();
-    const allow = jest.spyOn(limiter, 'allow');
+    const allowGuest = jest.spyOn(limiter, 'allowGuest');
     const gateway = new RealtimeGateway(
       new InstantRequestService(),
       limiter,
@@ -170,15 +170,20 @@ describe('RealtimeGateway connection rate limit', () => {
 
     await gateway.handleConnection(socket);
 
-    // no valid token: counted in the guest bucket, then refused
-    expect(allow).toHaveBeenCalledWith('203.0.113.7', 'guest');
+    // no valid token: counted as a guest of that ip, then refused
+    expect(allowGuest).toHaveBeenCalledWith('203.0.113.7');
     expect(disconnect).toHaveBeenCalledWith(true);
   });
 
-  // a connection from one shared ip with the given role; returns whether it was refused
-  async function connectFrom(gateway: RealtimeGateway, role: string | null) {
+  // a connection from one shared ip with the given role (a fresh user unless userId is given);
+  // returns whether it was refused
+  async function connectFrom(
+    gateway: RealtimeGateway,
+    role: string | null,
+    userId = `${role}-${Math.random()}`,
+  ) {
     (verifyRealtimeToken as jest.Mock).mockResolvedValueOnce(
-      role ? { userId: `${role}-${Math.random()}`, role } : null,
+      role ? { userId, role } : null,
     );
     const disconnect = jest.fn();
     const socket = {
@@ -217,7 +222,7 @@ describe('RealtimeGateway connection rate limit', () => {
     expect(await connectFrom(gateway, 'USER')).toBe(false);
   });
 
-  it('members keep 20 a minute, and using them up never blocks guests', async () => {
+  it('a member keeps 20 a minute per user; others on the ip and guests still connect', async () => {
     const gateway = new RealtimeGateway(
       new InstantRequestService(),
       new ConnectionRateLimiter(),
@@ -228,13 +233,13 @@ describe('RealtimeGateway connection rate limit', () => {
       sockets: { adapter: { rooms: new Map() }, sockets: new Map() },
     } as unknown as Server;
 
-    for (let i = 0; i < 10; i++) {
-      expect(await connectFrom(gateway, 'OWNER')).toBe(false);
-      expect(await connectFrom(gateway, 'USER')).toBe(false);
-    }
-    expect(await connectFrom(gateway, 'USER')).toBe(true);
-    expect(await connectFrom(gateway, 'OWNER')).toBe(true);
+    for (let i = 0; i < 20; i++)
+      expect(await connectFrom(gateway, 'USER', 'app-user-1')).toBe(false);
+    expect(await connectFrom(gateway, 'USER', 'app-user-1')).toBe(true);
 
+    // the limit is the user's, not the shared ip's
+    expect(await connectFrom(gateway, 'USER', 'app-user-2')).toBe(false);
+    expect(await connectFrom(gateway, 'OWNER', 'owner-1')).toBe(false);
     expect(await connectFrom(gateway, 'GUEST')).toBe(false);
   });
 });

@@ -1,54 +1,77 @@
 // packages
 import { Injectable } from '@nestjs/common';
 
-// guests (website list pages, and connections without a valid token) and members (USER / OWNER)
-// are counted apart, so guest page views on a shared ip (carrier nat) never block a consultant
-// or an app user behind the same ip
-export type RateLimitBucket = 'guest' | 'member';
-
 /**
- * simple in-memory sliding window, rejects ips opening
- * more than the allowed connections per minute, per bucket
+ * simple in-memory sliding windows of connection attempts per minute:
+ * - guests (website list pages, and connections without a valid token): per ip
+ * - members (USER / OWNER, token verified): per user, so app users behind one carrier ip (cgnat)
+ *   never share a limit, plus a high per-ip ceiling for members so one ip can't open member
+ *   connections without end
+ * guests and members never use up each other's windows
  */
 @Injectable()
 export class ConnectionRateLimiter {
-  // member attempts per ip
-  private readonly attempts = new Map<string, number[]>();
-  // guest attempts per ip, a window of their own
+  // guest attempts per ip
   private readonly guestAttempts = new Map<string, number[]>();
+  // member attempts per user id
+  private readonly memberAttempts = new Map<string, number[]>();
+  // member attempts per ip, for the ceiling
+  private readonly memberIpAttempts = new Map<string, number[]>();
   private readonly WINDOW_MS = 60_000;
-  private readonly MAX_ATTEMPTS = 20;
   private readonly MAX_GUEST_ATTEMPTS = 120;
+  private readonly MAX_MEMBER_ATTEMPTS = 20;
+  private readonly MAX_MEMBER_IP_ATTEMPTS = 300;
   private lastSweep = 0;
 
-  allow(ip: string, bucket: RateLimitBucket = 'member'): boolean {
+  allowGuest(ip: string): boolean {
     const now = Date.now();
     this.sweep(now);
 
-    const attempts = bucket === 'guest' ? this.guestAttempts : this.attempts;
-    const max =
-      bucket === 'guest' ? this.MAX_GUEST_ATTEMPTS : this.MAX_ATTEMPTS;
+    const byIp = this.recent(this.guestAttempts, ip, now);
+    if (byIp.length >= this.MAX_GUEST_ATTEMPTS) return false;
 
-    const recent = (attempts.get(ip) ?? []).filter(
-      (t) => now - t < this.WINDOW_MS,
-    );
-
-    if (recent.length >= max) return false;
-
-    recent.push(now);
-    attempts.set(ip, recent);
+    byIp.push(now);
+    this.guestAttempts.set(ip, byIp);
     return true;
   }
 
-  // once per window, drops every ip with no attempt inside it, so the maps never grow forever
+  // nothing is counted when either window is full
+  allowMember(userId: string, ip: string): boolean {
+    const now = Date.now();
+    this.sweep(now);
+
+    const byUser = this.recent(this.memberAttempts, userId, now);
+    const byIp = this.recent(this.memberIpAttempts, ip, now);
+    if (
+      byUser.length >= this.MAX_MEMBER_ATTEMPTS ||
+      byIp.length >= this.MAX_MEMBER_IP_ATTEMPTS
+    )
+      return false;
+
+    byUser.push(now);
+    byIp.push(now);
+    this.memberAttempts.set(userId, byUser);
+    this.memberIpAttempts.set(ip, byIp);
+    return true;
+  }
+
+  private recent(attempts: Map<string, number[]>, key: string, now: number) {
+    return (attempts.get(key) ?? []).filter((t) => now - t < this.WINDOW_MS);
+  }
+
+  // once per window, drops every key with no attempt inside it, so the maps never grow forever
   private sweep(now: number) {
     if (now - this.lastSweep < this.WINDOW_MS) return;
     this.lastSweep = now;
 
-    for (const attempts of [this.attempts, this.guestAttempts]) {
-      for (const [ip, times] of attempts) {
+    for (const attempts of [
+      this.guestAttempts,
+      this.memberAttempts,
+      this.memberIpAttempts,
+    ]) {
+      for (const [key, times] of attempts) {
         if (now - times[times.length - 1] >= this.WINDOW_MS)
-          attempts.delete(ip);
+          attempts.delete(key);
       }
     }
   }

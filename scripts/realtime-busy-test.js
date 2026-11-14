@@ -163,10 +163,10 @@ async function busy(body, secret = INTERNAL) {
 const timeout = (promise, ms = 2000) =>
   Promise.race([promise, wait(ms).then(() => null)]);
 
-// a connection with extra handshake headers (a guest unless a role is given):
-// refused = the server dropped it
-function probe(headers, role = 'GUEST') {
-  const userId =
+// a connection with extra handshake headers (a guest unless a role is given; a fresh user unless
+// userId is given): refused = the server dropped it
+function probe(headers, role = 'GUEST', userId = undefined) {
+  userId ??=
     role === 'GUEST' ? `guest:${crypto.randomUUID()}` : `test-${role.toLowerCase()}-${crypto.randomUUID()}`;
   return new Promise((resolve) => {
     const s = io(BASE, {
@@ -330,8 +330,9 @@ function probe(headers, role = 'GUEST') {
 
   guest.disconnect();
 
-  // 9. the rate limit follows the right-most x-forwarded-for entry, with separate buckets:
-  // 20 a minute for members (USER / OWNER), 120 for guests, neither able to block the other
+  // 9. the rate limit follows the right-most x-forwarded-for entry, with separate windows:
+  // members (USER / OWNER) 20 a minute per user (300 per ip as a ceiling), guests 120 a minute
+  // per ip, neither able to block the other
   if (LOCAL) {
     // test ips from 198.18.0.0/15 (benchmarking, 131k addresses), each one used once per run, so a
     // run started within a minute of the last one never meets an ip that run already used up
@@ -344,21 +345,26 @@ function probe(headers, role = 'GUEST') {
       return ip;
     };
     const limited = n();
+    const appUser = `test-user-${crypto.randomUUID()}`;
     const probes = [];
     for (let i = 0; i < 20; i++)
-      probes.push(await probe({ 'x-forwarded-for': `6.6.6.${i}, ${limited}` }, 'USER'));
-    check('members: 20 connections from one forwarded ip pass', probes.every((p) => !p.refused));
+      probes.push(await probe({ 'x-forwarded-for': `6.6.6.${i}, ${limited}` }, 'USER', appUser));
+    check('members: 20 connections of one user pass', probes.every((p) => !p.refused));
 
-    const over = await probe({ 'x-forwarded-for': `7.7.7.7, ${limited}` }, 'OWNER');
-    check('members: the 21st is refused, whatever the left-most entry says', over.refused);
+    const over = await probe({ 'x-forwarded-for': `7.7.7.7, ${limited}` }, 'USER', appUser);
+    check('members: that user\'s 21st is refused, whatever the left-most entry says', over.refused);
     probes.push(over);
 
-    const other = await probe({ 'x-forwarded-for': `${limited}, ${n()}` }, 'USER');
-    check('members: another right-most ip still connects', !other.refused);
-    probes.push(other);
+    const elsewhere = await probe({ 'x-forwarded-for': n() }, 'USER', appUser);
+    check('members: the limit is the user\'s, so another ip is refused too', elsewhere.refused);
+    probes.push(elsewhere);
+
+    const neighbour = await probe({ 'x-forwarded-for': limited }, 'USER');
+    check('members: another user on the same ip still connects (carrier nat)', !neighbour.refused);
+    probes.push(neighbour);
 
     const guestAfterMembers = await probe({ 'x-forwarded-for': limited });
-    check('a guest still connects from an ip whose member limit is used up', !guestAfterMembers.refused);
+    check('a guest still connects from an ip where a member is limited', !guestAfterMembers.refused);
     probes.push(guestAfterMembers);
 
     const shared = n();

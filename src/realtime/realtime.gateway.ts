@@ -72,13 +72,17 @@ export class RealtimeGateway
 
     const payload = await verifyRealtimeToken(token);
 
-    // the bucket comes from the verified role: guests, and connections without a valid token,
-    // count apart from USER / OWNER, so they can never use up a consultant's or app user's limit
+    // the window comes from the verified token: guests, and connections without a valid token,
+    // count per ip; USER / OWNER count per user (with a per-ip ceiling), so neither can use up
+    // the other's limit and app users behind one carrier ip never share one
     const ip = clientIp(socket.handshake);
-    const bucket = payload && payload.role !== 'GUEST' ? 'member' : 'guest';
-    if (!this.rateLimiter.allow(ip, bucket)) {
+    const member = payload && payload.role !== 'GUEST' ? payload : null;
+    const allowed = member
+      ? this.rateLimiter.allowMember(member.userId, ip)
+      : this.rateLimiter.allowGuest(ip);
+    if (!allowed) {
       this.logger.warn(
-        `rejected ${socket.id}: rate limited (ip: ${ip}, ${bucket})`,
+        `rejected ${socket.id}: rate limited (ip: ${ip}, ${member ? `member ${member.userId}` : 'guest'})`,
       );
       socket.disconnect(true);
       return;
